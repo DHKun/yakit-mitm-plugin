@@ -1,0 +1,5 @@
+.DS_Store
+*.yakc
+__pycache__/
+*.log
+/tmp/
