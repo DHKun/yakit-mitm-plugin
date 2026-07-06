@@ -1,0 +1,67 @@
+// struct.yak — TrafficRecord / PayloadCandidate / DiffResult 数据结构与构造函数
+// 智能流量辅助检测插件 · 数据层
+//
+// TrafficRecord: 一条被截获并去重后的流量记录
+// PayloadCandidate: LLM 或字典给出的 payload 候选
+// DiffResult: 差异重放后的判定结果
+
+// newTrafficRecord 构造一条流量记录
+// fingerprint 由 dedup.yak 计算；其余字段由调用方填充
+newTrafficRecord = func(id, fingerprint, method, url, rawParams, bodyPreview, status, respLen, timestamp) {
+    return {
+        "id": id,
+        "fingerprint": fingerprint,
+        "method": method,
+        "url": url,
+        "raw_params": rawParams,
+        "body_preview": bodyPreview,
+        "status": status,
+        "resp_len": respLen,
+        "timestamp": timestamp,
+    }
+}
+
+// newPayloadCandidate 构造一条 payload 候选
+// expectedDiffSignature 为空表示候选无效（会被上游直接丢弃）
+newPayloadCandidate = func(id, trafficId, param, payload, vulnHint, reason, confidence, expectedDiffSignature, source) {
+    return {
+        "id": id,
+        "traffic_id": trafficId,
+        "param": param,
+        "payload": payload,
+        "vuln_hint": vulnHint,
+        "reason": reason,
+        "confidence": confidence,
+        "expected_diff_signature": expectedDiffSignature,
+        "source": source, // "llm" | "fallback"
+    }
+}
+
+// candidateValid 校验候选是否满足硬约束：
+// 1. 必须有 expected_diff_signature（无预期差异特征的候选直接丢弃）
+// 2. 必须有 param 与 payload
+candidateValid = func(c) {
+    if c["expected_diff_signature"] == "" || c["expected_diff_signature"] == undefined {
+        return false
+    }
+    if c["param"] == "" || c["param"] == undefined {
+        return false
+    }
+    if c["payload"] == "" || c["payload"] == undefined {
+        return false
+    }
+    return true
+}
+
+// newDiffResult 构造一条差异判定结果
+// verdict: "differential" | "no_diff" | "noise" | "replay_failed"
+newDiffResult = func(candidateId, baselineHash, variantHash, diffScore, verdict, diffRegions) {
+    return {
+        "candidate_id": candidateId,
+        "baseline_hash": baselineHash,
+        "variant_hash": variantHash,
+        "diff_score": diffScore,
+        "verdict": verdict,
+        "diff_regions": diffRegions,
+    }
+}

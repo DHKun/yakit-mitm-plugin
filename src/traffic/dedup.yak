@@ -1,0 +1,137 @@
+// dedup.yak — 流量去重：剥离时间戳/随机参数后计算指纹
+// 智能流量辅助检测插件 · 降噪层
+//
+// 指纹 = md5(method + 规范化URL + 排序后的参数名集合 + 参数类型序列)
+// 计算指纹前剥离噪声参数（timestamp/_t/sign/nonce 等），同构请求只保留首条。
+// 目标：100 条同构流量 → ≤10 条。
+
+// NOISE_PARAM_RE 匹配常见噪声参数名（时间戳/随机数/签名字段）
+NOISE_PARAM_RE = `^(?:_?t(?:ime)?(?:stamp)?|ts|t|timestamp|nonce|noncestr|reqid|request_?id|trace_?id|sign|signature|token_?time|rand(?:om)?(?:_?id|_?str)?|_signature|csrf|csrf_?token|xsrf)$`
+
+// NOISE_VALUE_RE 匹配典型噪声值：13/10 位 Unix 时间戳、32/16/8 位十六进制随机串、UUID
+NOISE_VALUE_RE = `^(?:1[0-9]{9}|1[0-9]{12}|[0-9]{13}|[0-9]{10}|[0-9a-f]{32}|[0-9a-f]{16}|[0-9a-f]{8}|[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$`
+
+// isNoiseParam 判断参数名是否为噪声参数（黑名单剥离）
+isNoiseParam = func(name) {
+    if name == undefined || name == "" {
+        return true
+    }
+    lower = str.ToLower(name)
+    return re.Match(NOISE_PARAM_RE, lower)
+}
+
+// isNoiseValue 判断参数值是否为时间戳/随机串（值层面剥离）
+isNoiseValue = func(v) {
+    if v == undefined || v == "" {
+        return false
+    }
+    v = string(v)
+    if len(v) < 8 {
+        return false
+    }
+    return re.Match(NOISE_VALUE_RE, str.ToLower(v))
+}
+
+// paramTypeOf 推断参数的粗粒度类型（int/float/bool/json/id-like/string）
+paramTypeOf = func(v) {
+    if v == undefined {
+        return "string"
+    }
+    s = string(v)
+    if s == "" {
+        return "string"
+    }
+    if re.Match(`^-?\d+$`, s) {
+        return "int"
+    }
+    if re.Match(`^-?\d+\.\d+$`, s) {
+        return "float"
+    }
+    if s == "true" || s == "false" {
+        return "bool"
+    }
+    if str.HasPrefix(s, "{") || str.HasPrefix(s, "[") {
+        return "json"
+    }
+    return "string"
+}
+
+// fingerprintParams 对参数集合计算"参数名集合 + 参数类型序列"的规范化字符串
+// 输入: params 为 map[string]string（或 map[string]any），只取参数名与类型，不看值
+fingerprintParams = func(params) {
+    names = []
+    for k, v in params {
+        if isNoiseParam(k) {
+            continue
+        }
+        names = append(names, str.ToLower(k) + ":" + paramTypeOf(v))
+    }
+    x.Sort(names, (i, j) => names[i] < names[j])
+    return str.Join(names, ",")
+}
+
+// normalizeUrlPath 提取 URL 的 path 部分（协议/host/端口/查询串全部剥离）
+// http://a.com:8080/x/y?z=1 → /x/y
+normalizeUrlPath = func(url) {
+    if url == undefined || url == "" {
+        return ""
+    }
+    u = string(url)
+    // 去掉 scheme://host:port 前缀
+    m = re.FindSubmatch(u, `^[a-zA-Z][a-zA-Z0-9+.-]*://[^/]+`)
+    if m != undefined && len(m) > 0 && m[0] != "" {
+        u, _ = str.CutPrefix(u, m[0])
+    }
+    // 去掉查询串（保留首段）
+    parts = str.SplitN(u, "?", 2)
+    return parts[0]
+}
+
+// computeFingerprint 计算一条流量的指纹
+// fingerprint = md5(method + 规范化path + 参数名:类型集合)
+// 参数值不参与指纹——同参数不同值视为同构请求
+computeFingerprint = func(method, url, params) {
+    path = normalizeUrlPath(url)
+    paramPart = fingerprintParams(params)
+    raw = str.ToUpper(string(method)) + "|" + path + "|" + paramPart
+    return codec.Md5(raw)
+}
+
+// newDeduplicator 创建一个新的去重器实例（线程安全，跨流量保持状态）
+// seen: 指纹 → 首次出现时间；count: 指纹 → 累计出现次数
+newDeduplicator = func() {
+    return {
+        "seen": sync.NewMap(),
+        "count": sync.NewMap(),
+    }
+}
+
+// dedupSeen 判断指纹是否已见过；未见过的指纹会被登记
+// 返回 [是否重复(bool), 该指纹累计出现次数(int)]
+dedupSeen = func(dedup, fingerprint) {
+    _, loaded = dedup["seen"].LoadOrStore(fingerprint, time.Now().Unix())
+    cnt = 1
+    if loaded {
+        prev, _ = dedup["count"].Load(fingerprint)
+        if prev != undefined {
+            cnt = int(prev) + 1
+        }
+        dedup["count"].Store(fingerprint, cnt)
+        return true, cnt
+    }
+    dedup["count"].Store(fingerprint, cnt)
+    return false, cnt
+}
+
+// dedupStats 统计去重器状态：[已登记指纹数, 总命中次数]
+dedupStats = func(dedup) {
+    uniq = 0
+    total = 0
+    counter = dedup["count"]
+    counter.Range(func(k, v) {
+        uniq = uniq + 1
+        total = total + int(v)
+        return true
+    })
+    return uniq, total
+}

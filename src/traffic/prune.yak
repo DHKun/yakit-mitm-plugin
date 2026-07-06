@@ -1,0 +1,48 @@
+// prune.yak — 参数剪枝：白名单放行、黑名单剥离
+// 智能流量辅助检测插件 · 降噪层
+//
+// 白名单：安全可注入的探测参数（id/page/uid 等），直接进入候选生成
+// 黑名单：改了必然破坏请求语义的参数（csrf/session/password 等），剪掉不测
+// 目标：剪枝率 ≥60%（在真实混合参数集上）
+
+// PRUNE_BLACKLIST_RE 命中即剪除——这些参数一旦被改，请求会直接失效
+// （会话/CSRF/密码/验证码/一次性令牌/追踪/内部路由字段）
+PRUNE_BLACKLIST_RE = `^(?:csrf(?:_?token)?|xsrf(?:_?token)?|password|passwd|pwd|pass|confirm_?pass(?:word)?|captcha|verify_?code|vcode|sms_?code|otp|two_?factor|auth|authorization|session(?:_?id)?|sid|jsessionid|phpsessid|asp\.net_?sessionid|token|access_?token|refresh_?token|api_?key|apikey|secret|client_?secret|signature|_?signature|sign|timestamp|_?t(?:ime)?(?:stamp)?|ts|nonce|noncestr|delete|remove|action=delete|method|_method|redirect|callback|return_?url|next|continue|file|path=/?etc|filepath|req(?:uest)?_?id|trace_?id|span_?id|parent_?id|logid|utm_[a-z_]+|gclid|fbclid|msclkid|ref(?:err?er)?|source|medium|campaign|partner|aff(?:iliate)?(?:_?id)?|pv_?id|click_?id|cid_|zc_?id|from_?id)$`
+
+// PRUNE_WHITELIST_RE 命中即放行——高价值探测参数（分页/查询/ID/搜索类）
+PRUNE_WHITELIST_RE = `^(?:id|uid|user_?id|uid2|pid|cid|nid|tid|sid_?num|page|p|page_?no|page_?num|page_?size|size|limit|offset|skip|index|sort|order|order_?by|sort_?by|q|query|keyword|kw|search|s|wd|name|title|category|cat|type|tag|filter|from|to|start|end|date|uid_?list|ids|id_?list|no|num|count|pageindex|pagesize)$`
+
+// pruneParams 对参数 map 剪枝，返回 [保留参数map, 被剪掉数量, 原始总数]
+// 规则优先级：黑名单 > 白名单 > 默认（普通参数按剪枝策略保留字符串类，剪掉长随机值）
+pruneParams = func(params) {
+    kept = {}
+    pruned = 0
+    total = 0
+    for k, v in params {
+        total = total + 1
+        lower = str.ToLower(string(k))
+        if re.Match(PRUNE_BLACKLIST_RE, lower) {
+            pruned = pruned + 1
+            continue
+        }
+        if re.Match(PRUNE_WHITELIST_RE, lower) {
+            kept[k] = v
+            continue
+        }
+        // 非白名单非黑名单：值是噪声（长随机串/时间戳）的剪掉，其余保留
+        if isNoiseValue(v) {
+            pruned = pruned + 1
+            continue
+        }
+        kept[k] = v
+    }
+    return kept, pruned, total
+}
+
+// pruneRatio 计算剪枝率
+pruneRatio = func(pruned, total) {
+    if total == 0 {
+        return 0.0
+    }
+    return float(pruned) / float(total)
+}
