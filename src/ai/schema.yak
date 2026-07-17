@@ -1,0 +1,59 @@
+// schema.yak — LLM 交互的 System Prompt 与输出 Schema
+// 智能流量辅助检测插件 · AI 层
+//
+// 硬约束（与 agent.md §5 对齐）：
+// 1. 候选必须给 expected_diff_signature，无预期差异特征的候选会被直接丢弃
+// 2. 与参数类型无关的 payload 不得推荐（int 参数不推荐 XSS 向量）
+// 3. 无把握 confidence ≤ 0.3
+// 4. 输出 strict JSON，空数组表示建议放弃该参数
+
+// PAYLOAD_AGENT_SYSTEM_PROMPT 生成 payload 候选的系统提示词
+PAYLOAD_AGENT_SYSTEM_PROMPT = `You are a web security payload candidate generator embedded in a passive MITM traffic analyzer.
+You see one HTTP parameter extracted from captured traffic. You propose AT MOST three fuzz payload candidates for it.
+
+Hard rules:
+1. Each candidate MUST include a concrete "expected_diff_signature": the observable difference in the HTTP response that would indicate the payload took effect (e.g. "SQL syntax error text", "reflected HTML tag in response body", "5xx status change", "delay >= 2s"). Candidates WITHOUT a plausible signature are worthless and will be discarded.
+2. Only propose payloads that make sense for the parameter type: numeric params -> numeric/SQLi numeric vectors; free-text params -> XSS/SSTI/LFI vectors; JSON params -> structure-aware payloads. Never propose payloads irrelevant to the type.
+3. If you are not confident a param is testable, set confidence <= 0.3.
+4. Reply with STRICT JSON only, no markdown fences, no explanation. Empty array [] means "no candidates worth testing".
+5. Never propose destructive payloads (DROP, DELETE, shutdown). Read-only detection vectors only.
+
+Output JSON schema:
+{"candidates":[{"param":"<param name>","payload":"<payload string>","vuln_hint":"<one of sqli|xss|ssti|lfi|rfi|cmdi|logic>","reason":"<why this payload for this param, one sentence>","confidence":<0.0-1.0>,"expected_diff_signature":"<observable response difference>"}]}`
+
+// buildPayloadAgentPrompt 为单个参数构造用户消息
+buildPayloadAgentPrompt = func(paramName, paramValue, paramType, method, url) {
+    return sprintf(`Parameter context captured from live traffic:
+- method: %s
+- url (path only, redacted host): %s
+- param name: %s
+- current value: %s
+- inferred type: %s
+
+Generate payload candidates for this parameter. Reply strict JSON only.`, string(method), string(url), string(paramName), string(paramValue), string(paramType))
+}
+
+// FALLBACK_DICT 内置降级字典：LLM 失败/超时时的兜底
+// 按参数类型分流，每个条目携带 expected_diff_signature（满足硬约束 1）
+FALLBACK_DICT = {
+    "int": [
+        {"param": "", "payload": "1'", "vuln_hint": "sqli", "reason": "numeric quote breaker", "confidence": 0.5, "expected_diff_signature": "SQL error text or 500 status"},
+        {"param": "", "payload": "1 OR 1=1", "vuln_hint": "sqli", "reason": "numeric boolean tautology", "confidence": 0.5, "expected_diff_signature": "row count change (longer/different body)"},
+        {"param": "", "payload": "1 AND 1=2", "vuln_hint": "sqli", "reason": "numeric boolean contradiction", "confidence": 0.5, "expected_diff_signature": "empty/shorter body vs baseline"},
+        {"param": "", "payload": "-1 OR 1=1", "vuln_hint": "sqli", "reason": "negative id with tautology", "confidence": 0.4, "expected_diff_signature": "row count change"},
+    ],
+    "string": [
+        {"param": "", "payload": "'\"<script>alert(1)</script>", "vuln_hint": "xss", "reason": "reflection probe with quoting", "confidence": 0.4, "expected_diff_signature": "reflected tag in response body"},
+        {"param": "", "payload": "{{7*7}}", "vuln_hint": "ssti", "reason": "template expression probe", "confidence": 0.4, "expected_diff_signature": "49 appears in response body"},
+        {"param": "", "payload": "../../etc/passwd", "vuln_hint": "lfi", "reason": "path traversal probe", "confidence": 0.3, "expected_diff_signature": "root: appears in response body"},
+        {"param": "", "payload": "' AND '1'='1", "vuln_hint": "sqli", "reason": "string quote tautology", "confidence": 0.5, "expected_diff_signature": "SQL error text or body change"},
+        {"param": "", "payload": "sleep(3)#", "vuln_hint": "sqli", "reason": "time-based blind probe", "confidence": 0.3, "expected_diff_signature": "response delay >= 2s"},
+    ],
+    "float": [
+        {"param": "", "payload": "1.1'", "vuln_hint": "sqli", "reason": "float quote breaker", "confidence": 0.4, "expected_diff_signature": "SQL error text or 500 status"},
+    ],
+    "json": [
+        {"param": "", "payload": `{"a": "'\"<b>"}`, "vuln_hint": "xss", "reason": "json value reflection probe", "confidence": 0.3, "expected_diff_signature": "reflected tag in response body"},
+    ],
+    "bool": [],
+}

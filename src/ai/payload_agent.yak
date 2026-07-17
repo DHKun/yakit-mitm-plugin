@@ -1,0 +1,167 @@
+// payload_agent.yak — LLM 调用统一封装（本项目唯一的 LLM 出口）
+// 智能流量辅助检测插件 · AI 层
+//
+// 职责：
+// 1. 所有 LLM 调用必须走本文件（禁止各文件直连——见 AI_INIT.md 上下文规则）
+// 2. strict JSON 输出解析与候选校验（无 expected_diff_signature 直接丢弃）
+// 3. 失败/超时降级到 fallback_dict，保证主链路不中断
+//
+// LLM 后端：OpenAI 兼容 API（ai.OpenAI + ai.apiKey/ai.baseURL/ai.model/ai.timeout）
+
+// buildLlmClient 构造 LLM 客户端
+// cfg: {"base_url": str, "api_key": str, "model": str, "timeout": float}
+// base_url 为空时返回 nil（表示 LLM 未配置，直接走降级路径）
+buildLlmClient = func(cfg) {
+    if cfg == undefined || cfg == nil {
+        return nil
+    }
+    if cfg["base_url"] == undefined || cfg["base_url"] == "" {
+        return nil
+    }
+    apiKey = cfg["api_key"]
+    if apiKey == undefined {
+        apiKey = ""
+    }
+    model = cfg["model"]
+    if model == undefined || model == "" {
+        model = "gpt-4o-mini"
+    }
+    t = cfg["timeout"]
+    if t == undefined || t == "" {
+        t = 30.0
+    }
+    return ai.OpenAI(
+        ai.apiKey(string(apiKey)),
+        ai.baseURL(string(cfg["base_url"])),
+        ai.model(string(model)),
+        ai.timeout(float(t)),
+    )
+}
+
+// LLM_STATE 全局 LLM 客户端缓存与失败计数（防反复重试拖垮链路）
+// 注意：不预置 "client" 键，未初始化时取值为 nil（undefined）
+LLM_STATE = {
+    "inited": false,
+    "fail_count": 0,
+}
+
+// initLlm 从 MITM_PARAMS / cli 参数初始化 LLM 客户端（幂等）
+initLlm = func(cfg) {
+    if LLM_STATE["inited"] {
+        return LLM_STATE["client"]
+    }
+    LLM_STATE["inited"] = true
+    LLM_STATE["client"] = buildLlmClient(cfg)
+    return LLM_STATE["client"]
+}
+
+// llmGenerateCandidates 用 LLM 为单个参数生成候选
+// 成功返回 [candidates数组, nil]；失败返回 [nil, err]
+llmGenerateCandidates = func(client, paramName, paramValue, paramType, method, urlPath) {
+    if client == nil {
+        return nil, "llm client not configured"
+    }
+    prompt = PAYLOAD_AGENT_SYSTEM_PROMPT + "\n\n---\n" + buildPayloadAgentPrompt(paramName, paramValue, paramType, method, urlPath)
+    rsp, err = client.Chat(prompt)
+    if err != nil {
+        return nil, f"llm chat failed: ${err}"
+    }
+    if rsp == undefined || rsp == "" {
+        return nil, "llm returned empty response"
+    }
+    // 解析 strict JSON（容错：剥掉可能的 markdown 代码块围栏）
+    raw = string(rsp)
+    raw = str.TrimSpace(raw)
+    raw = re.ReplaceAll(raw, "```(?:json)?", "")
+    raw = re.ReplaceAll(raw, "```", "")
+    raw = str.TrimSpace(raw)
+    start = str.Index(raw, "{")
+    end = str.LastIndex(raw, "}")
+    if start < 0 || end < 0 || end <= start {
+        return nil, "llm response is not JSON"
+    }
+    raw = raw[start : end+1]
+    parsed = json.loads(raw)
+    if parsed == nil || parsed == undefined {
+        return nil, "llm response is not a JSON object"
+    }
+    arr = parsed["candidates"]
+    // 注意：yak 中空数组与 nil 都 == nil，用 string() 区分
+    // string(missing) == "" 而 string([]) == "[]"
+    if string(arr) == "" {
+        return nil, "llm response missing candidates field"
+    }
+    if len(arr) == 0 {
+        return [], nil // 空数组：LLM 建议放弃该参数
+    }
+    out = []
+    for i = 0; i < len(arr); i++ {
+        item = arr[i]
+        c = {
+            "param": string(item["param"]),
+            "payload": string(item["payload"]),
+            "vuln_hint": string(item["vuln_hint"]),
+            "reason": string(item["reason"]),
+            "confidence": float(item["confidence"]),
+            "expected_diff_signature": string(item["expected_diff_signature"]),
+        }
+        // 硬约束：无 expected_diff_signature 的候选直接丢弃
+        if c["expected_diff_signature"] == "" || c["expected_diff_signature"] == "<nil>" {
+            continue
+        }
+        // 硬约束：payload 为空的丢弃
+        if c["payload"] == "" || c["payload"] == "<nil>" {
+            continue
+        }
+        out = append(out, c)
+    }
+    return out, nil
+}
+
+// fallbackCandidates 字典降级：按参数类型返回内置候选
+fallbackCandidates = func(paramName, paramType) {
+    dict = FALLBACK_DICT[paramType]
+    if string(dict) == "" || len(dict) == 0 {
+        // bool/未知类型无内置向量，返回空（放弃该参数）
+        return []
+    }
+    out = []
+    for i = 0; i < len(dict); i++ {
+        item = dict[i]
+        c = {
+            "param": paramName,
+            "payload": item["payload"],
+            "vuln_hint": item["vuln_hint"],
+            "reason": item["reason"],
+            "confidence": item["confidence"],
+            "expected_diff_signature": item["expected_diff_signature"],
+        }
+        out = append(out, c)
+    }
+    for i = 0; i < len(out); i++ {
+        out[i]["param"] = paramName
+        out[i]["source"] = "fallback"
+    }
+    return out
+}
+
+// generateCandidates 候选生成统一入口：LLM 优先、失败降级字典
+// 返回 [candidates, usedLlm(bool)]
+generateCandidates = func(client, paramName, paramValue, paramType, method, urlPath) {
+    if client != nil && LLM_STATE["fail_count"] < 3 {
+        cands, err = llmGenerateCandidates(client, paramName, paramValue, paramType, method, urlPath)
+        if err == nil {
+            if len(cands) == 0 {
+                return [], true // LLM 明确放弃该参数
+            }
+            for i = 0; i < len(cands); i++ {
+                cands[i]["param"] = paramName
+                cands[i]["source"] = "llm"
+            }
+            return cands, true
+        }
+        // LLM 失败：计数并降级
+        LLM_STATE["fail_count"] = LLM_STATE["fail_count"] + 1
+    }
+    return fallbackCandidates(paramName, paramType), false
+}
