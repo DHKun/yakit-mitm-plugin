@@ -1,0 +1,57 @@
+// panel.yak — Yakit GUI 面板输出
+// 智能流量辅助检测插件 · 展示层
+//
+// 展示原则：面板只展示有差异（differential）的判定；noise/no_diff 折叠进日志。
+// 复用 yakit.Info / yakit.Error / yakit.Output(yakit.NewTable) / yakit.StatusCard。
+
+// PANEL_TABLE_TITLE 结果表名
+PANEL_TABLE_TITLE = "AI 流量辅助检测"
+
+// panelInit 初始化面板（状态卡片 + 实时表）
+panelInit = func() {
+    yakit.AutoInitYakit()
+    yakit.StatusCard("mitm-ai-sensor-status", "AI 流量辅助检测已启动：截获 → 去重 → 剪枝 → 候选生成 → 差异实证")
+}
+
+// panelProgress 更新状态卡
+panelProgress = func(totalSeen, uniqueKept, candidatesGen, verified) {
+    yakit.StatusCard("mitm-ai-sensor-status", sprintf("截获 %d | 去重保留 %d | 候选 %d | 实证差异 %d", totalSeen, uniqueKept, candidatesGen, verified))
+}
+
+// panelReportDifferential 面板输出一条 differential 判定（汇总表）
+panelReportDifferential = func(traffic, candidate, diffResult) {
+    table = yakit.NewTable("URL", "方法", "参数", "Payload", "漏洞提示", "diff_score", "预期差异特征", "来源")
+    table.Append(
+        string(traffic["url"]),
+        string(traffic["method"]),
+        string(candidate["param"]),
+        string(candidate["payload"]),
+        string(candidate["vuln_hint"]),
+        sprintf("%.3f", float(diffResult["diff_score"])),
+        string(candidate["expected_diff_signature"]),
+        string(candidate["source"]),
+    )
+    yakit.Output(table)
+    // 同时写一条风险记录，让 Yakit 的风险页也能看到
+    risk.NewRisk(string(traffic["url"]),
+        risk.title(sprintf("[AI 辅助检测] %s 疑似注入点: %s", candidate["vuln_hint"], candidate["param"])),
+        risk.type(string(candidate["vuln_hint"])),
+        risk.severity("low"),
+        risk.description(sprintf("payload: %s\n预期差异特征: %s\n实际 diff_score: %.3f\n变化段: %s", candidate["payload"], candidate["expected_diff_signature"], float(diffResult["diff_score"]), str.Join(diffResult["diff_regions"], " | "))),
+    )
+}
+
+// panelReportVerdict 按判定结果分流到面板/日志
+panelReportVerdict = func(traffic, candidate, diffResult) {
+    v = string(diffResult["verdict"])
+    if v == "differential" {
+        panelReportDifferential(traffic, candidate, diffResult)
+        return
+    }
+    if v == "replay_failed" {
+        yakit.Warn("重放失败: %s %s param=%s payload=%s", traffic["method"], traffic["url"], candidate["param"], candidate["payload"])
+        return
+    }
+    // no_diff / noise 只进日志
+    yakit.Info("无差异(%s): %s %s param=%s payload=%s score=%.3f", v, traffic["method"], traffic["url"], candidate["param"], candidate["payload"], float(diffResult["diff_score"]))
+}

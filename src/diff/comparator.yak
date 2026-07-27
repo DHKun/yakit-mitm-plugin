@@ -1,0 +1,228 @@
+// comparator.yak — 结构化 Diff 判定
+// 智能流量辅助检测插件 · 差异实证层
+//
+// 判定流程：
+// 1. 归一化两份响应（剥时间戳/随机数/换行/空白噪声）
+// 2. 按行计算 diff，得到变化段
+// 3. diff_score = 变化段长度 / 总长
+// 4. verdict: score > 0.05 且含语义变化 → differential；仅噪声 → noise；其余 → no_diff
+//
+// 阈值与 agent.md §6 对齐：DIFF_THRESHOLD = 0.05
+
+DIFF_THRESHOLD = 0.05
+
+// NOISE_LINE_RE 匹配纯噪声行（时间戳/随机串/token/日期行）
+NOISE_LINE_RE = `(?:1[0-9]{12,}|timestamp|"?time"?\s*[:=]|nonce|signature|generated[_ ]at|request[_ ]id|trace[_ ]id|session|csrf|cache|etag|set-cookie|x-request-id|date:)`
+
+// normalizeResponse 归一化响应文本：
+// 1. 只取响应体（headers 含 Date/Set-Cookie 等天然噪声，不参与 diff）
+// 2. 时间戳/长随机十六进制串 → 占位符
+// 3. 换行/空白规整
+normalizeResponse = func(rspRaw) {
+    if rspRaw == undefined || rspRaw == nil {
+        return ""
+    }
+    body = poc.GetHTTPPacketBody(string(rspRaw))
+    s = string(body)
+    // 噪声字段整体抹除（连同键名与残留逗号）："request_id":"x" / "ts": 123 ...
+    // 这些字段每次请求必变，不构成语义差异
+    s = re.ReplaceAll(s, `,\s*"?[\w-]*(?:timestamp|request_?id|trace_?id|span_?id|nonce|signature|session_?id|req_?id|log_?id)"?\s*:\s*"?[\w-]*"?`, "")
+    s = re.ReplaceAll(s, `"?:?(?:timestamp|request_?id|trace_?id|span_?id|nonce|signature|session_?id|req_?id|log_?id)"?\s*:\s*"?[\w-]*"?,?\s*`, "")
+    s = re.ReplaceAll(s, `,\s*"?(?:ts|_t|time)"?\s*:\s*"?[\w:.+-]*"?`, "")
+    s = re.ReplaceAll(s, `"?(?:ts|_t|time)"?\s*:\s*"?[\w:.+-]*"?,?\s*`, "")
+    // 13/10 位 Unix 时间戳 → T
+    s = re.ReplaceAll(s, `\b1[0-9]{9,12}\b`, "T")
+    // 32 位十六进制（md5/session类） → H
+    s = re.ReplaceAll(s, `\b[0-9a-f]{32}\b`, "H")
+    // 16 位十六进制 → X
+    s = re.ReplaceAll(s, `\b[0-9a-f]{16}\b`, "X")
+    // UUID → U
+    s = re.ReplaceAll(s, `\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b`, "U")
+    // 制表符/回车统一
+    s = str.ReplaceAll(s, "\r\n", "\n")
+    s = str.ReplaceAll(s, "\t", " ")
+    // 每行行尾空白与空行压缩
+    lines = str.Split(s, "\n")
+    out = []
+    for i = 0; i < len(lines); i++ {
+        ln = str.TrimSpace(lines[i])
+        if ln == "" {
+            continue
+        }
+        out = append(out, ln)
+    }
+    return str.Join(out, "\n")
+}
+
+// isNoiseLine 判断一行是否为噪声行：
+// 1. 整行是纯噪声头/字段（Set-Cookie/ETag/Date 等）
+// 2. JSON/表单行：所有键名都是噪声键，且不含内容型键 → 噪声行
+isNoiseLine = func(line) {
+    ln = str.ToLower(string(line))
+    if re.Match(`^\s*["']?(?:set-cookie|etag|date|cache-control|x-request-id|expires|last-modified)`, ln) {
+        return true
+    }
+    // 内容型键存在 → 非噪声行
+    contentKeyRe = `["']?(?:id|name|title|content|data|list|msg|message|status|code|err|error|result|user|price|count|total|items|rows|page)["']?\s*:`
+    if re.Match(contentKeyRe, ln) {
+        return false
+    }
+    // 提取键名，全部命中噪声 token → 噪声行
+    keys = re.FindAll(ln, `["']?([a-z0-9_-]+)["']?\s*:`)
+    if len(keys) == 0 {
+        return re.Match(NOISE_LINE_RE, ln)
+    }
+    for k in keys {
+        if !re.Match(NOISE_LINE_RE, k) {
+            return false
+        }
+    }
+    return true
+}
+
+// computeDiff 计算两份归一化文本的行级 diff
+// 返回 [diffScore, 变化段描述数组]
+// 算法：朴素 LCS 太重，这里用行哈希对齐的简化算法——
+// 把每行 md5 后做集合比较 + 首尾公共前缀/后缀裁剪，变化段 = 中间不匹配部分
+computeDiff = func(textA, textB) {
+    a = str.Split(textA, "\n")
+    b = str.Split(textB, "\n")
+    // 裁剪公共前缀
+    pre = 0
+    for true {
+        if pre >= len(a) || pre >= len(b) {
+            break
+        }
+        if a[pre] != b[pre] {
+            break
+        }
+        pre = pre + 1
+    }
+    // 裁剪公共后缀
+    suf = 0
+    for true {
+        if suf >= len(a)-pre || suf >= len(b)-pre {
+            break
+        }
+        if a[len(a)-1-suf] != b[len(b)-1-suf] {
+            break
+        }
+        suf = suf + 1
+    }
+    midA = []
+    midB = []
+    if pre < len(a)-suf {
+        midA = a[pre : len(a)-suf]
+    }
+    if pre < len(b)-suf {
+        midB = b[pre : len(b)-suf]
+    }
+    changedLen = len(midA) + len(midB)
+    total = len(a) + len(b)
+    if total == 0 {
+        return 0.0, []
+    }
+    score = float(changedLen) / float(total)
+    regions = []
+    if len(midA) > 0 {
+        regions = append(regions, "baseline[" + string(pre) + ":" + string(pre+len(midA)) + "] " + previewLines(midA))
+    }
+    if len(midB) > 0 {
+        regions = append(regions, "variant[" + string(pre) + ":" + string(pre+len(midB)) + "] " + previewLines(midB))
+    }
+    return score, regions
+}
+
+// previewLines 取变化段前 3 行拼预览（避免面板输出爆炸）
+previewLines = func(lines) {
+    n = len(lines)
+    if n > 3 {
+        n = 3
+    }
+    items = []
+    for i = 0; i < n; i++ {
+        ln = lines[i]
+        if len(ln) > 60 {
+            ln = str.ShrinkString(ln, 57) + "..."
+        }
+        items = append(items, ln)
+    }
+    return str.Join(items, " / ")
+}
+
+// hasSemanticChange 判断变化段是否含语义变化（非纯噪声）
+// 变化行全部是噪声行 → 不算语义变化
+hasSemanticChange = func(textA, textB) {
+    a = str.Split(textA, "\n")
+    b = str.Split(textB, "\n")
+    pre = 0
+    for true {
+        if pre >= len(a) || pre >= len(b) {
+            break
+        }
+        if a[pre] != b[pre] {
+            break
+        }
+        pre = pre + 1
+    }
+    suf = 0
+    for true {
+        if suf >= len(a)-pre || suf >= len(b)-pre {
+            break
+        }
+        if a[len(a)-1-suf] != b[len(b)-1-suf] {
+            break
+        }
+        suf = suf + 1
+    }
+    midA = []
+    midB = []
+    if pre < len(a)-suf {
+        midA = a[pre : len(a)-suf]
+    }
+    if pre < len(b)-suf {
+        midB = b[pre : len(b)-suf]
+    }
+    for i = 0; i < len(midA); i++ {
+        if !isNoiseLine(midA[i]) {
+            return true
+        }
+    }
+    for i = 0; i < len(midB); i++ {
+        if !isNoiseLine(midB[i]) {
+            return true
+        }
+    }
+    return false
+}
+
+// compareResponses 差异判定入口
+// baselineRsp / variantRsp 为原始 HTTP 响应报文（[]byte 或 string）
+// 返回 DiffResult map（见 struct.yak）
+compareResponses = func(candidateId, baselineRsp, variantRsp) {
+    na = normalizeResponse(baselineRsp)
+    nb = normalizeResponse(variantRsp)
+    baseHash = codec.Md5(na)
+    varHash = codec.Md5(nb)
+    if baseHash == varHash {
+        return newDiffResult(candidateId, baseHash, varHash, 0.0, "no_diff", [])
+    }
+    score, regions = computeDiff(na, nb)
+    semantic = hasSemanticChange(na, nb)
+    verdict = "no_diff"
+    if semantic {
+        if score > DIFF_THRESHOLD {
+            // 比例显著变化
+            verdict = "differential"
+        } else if len(regions) > 0 && len(regions) <= 8 {
+            // 稀疏变化：长响应中少数行变化（score 被总长稀释）
+            // 例：100 行响应中 1 行报 SQL 错误 → score 0.01 但必须报告
+            verdict = "differential"
+        } else {
+            verdict = "noise"
+        }
+    } else {
+        verdict = "noise"
+    }
+    return newDiffResult(candidateId, baseHash, varHash, score, verdict, regions)
+}
