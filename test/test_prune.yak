@@ -1,0 +1,72 @@
+// test_prune.yak — 剪枝模块单元测试
+// 运行: cd src && yak ../test/test_prune.yak
+//
+// 用例：
+// 1. 黑名单参数（csrf/session/password/token 等）全部剪除
+// 2. 白名单参数（id/page/keyword 等）全部保留
+// 3. 真实混合参数集剪枝率 ≥60%（验收指标）
+// 4. 长随机值噪声参数剪除
+
+include "traffic/dedup.yak"
+include "traffic/prune.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+
+// ---- 用例 1: 黑名单剪除 ----
+blacklistSet = {
+    "csrf_token": "x", "session_id": "y", "password": "z",
+    "access_token": "t", "nonce": "n", "timestamp": "1700000000",
+    "sign": "s", "captcha": "c", "JSESSIONID": "j", "auth": "a",
+}
+kept, pruned, total = pruneParams(blacklistSet)
+assertEq("黑名单参数全部剪除", pruned, 10)
+assertEq("黑名单剪除后无保留", len(kept), 0)
+
+// ---- 用例 2: 白名单保留 ----
+whitelistSet = {
+    "id": "42", "page": "1", "keyword": "abc", "uid": "7",
+    "q": "s", "sort": "asc", "limit": "10", "offset": "0",
+}
+kept2, pruned2, total2 = pruneParams(whitelistSet)
+assertEq("白名单参数全部保留", len(kept2), 8)
+assertEq("白名单参数无剪除", pruned2, 0)
+
+// ---- 用例 3: 真实混合参数集剪枝率 ≥60% ----
+mixedSet = {
+    "id": "42", "page": "1", "keyword": "abc",
+    "csrf_token": "abc123def456", "session_id": "xyz", "JSESSIONID": "aaa",
+    "timestamp": "1700000000", "nonce": "aabbccdd", "sign": "deadbeef",
+    "token": "eyJhbGciOiJIUzI1NiJ9.payload.signature", "_signature": "aa112233445566",
+    "request_id": "12345678", "trace_id": "ff0011", "XSRF-TOKEN": "xx",
+    "access_token": "yy", "auth": "zz", "callback": "cb",
+}
+kept3, pruned3, total3 = pruneParams(mixedSet)
+ratio = pruneRatio(pruned3, total3)
+println("     混合集: total", total3, "pruned", pruned3, "ratio", ratio)
+assertEq("混合参数集剪枝率 ≥ 0.6", ratio >= 0.6, true)
+
+// ---- 用例 4: 长随机值噪声剪除 ----
+noiseValues = {
+    "tracking_a": "d41d8cd98f00b204e9800998ecf8427e",
+    "tracking_b": "550e8400-e29b-41d4-a716-446655440000",
+    "keep_me": "normalvalue",
+}
+kept4, pruned4, _ = pruneParams(noiseValues)
+assertEq("随机值噪声参数剪除数", pruned4, 2)
+assertEq("普通值参数保留数", len(kept4), 1)
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_prune FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_prune PASS (all assertions) ====")

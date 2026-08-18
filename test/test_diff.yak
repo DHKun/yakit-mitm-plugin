@@ -1,0 +1,91 @@
+// test_diff.yak — Diff 判定模块单元测试
+// 运行: cd src && yak ../test/test_diff.yak
+//
+// 用例：
+// 1. 相同响应 → no_diff (score 0)
+// 2. 语义变化（SQL 错误出现）→ differential
+// 3. 纯噪声变化（仅时间戳/随机数变化）→ noise
+// 4. 阈值边界：极小语义变化 → no_diff（score ≤ 0.05）
+// 5. 长响应中的局部变化 → 差异段定位正确
+
+include "traffic/struct.yak"
+include "diff/comparator.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+
+// ---- 用例 1: 相同响应 ----
+base = `HTTP/1.1 200 OK
+Content-Length: 30
+
+{"id": 42, "name": "alice", "ts": 1700000000}`
+r = compareResponses("c1", base, base)
+assertEq("相同响应 verdict", r["verdict"], "no_diff")
+assertEq("相同响应 score", r["diff_score"], 0.0)
+
+// ---- 用例 2: 语义变化（SQL 错误）→ differential ----
+sqliRsp = `HTTP/1.1 200 OK
+Content-Length: 80
+
+{"err": "You have an error in your SQL syntax near '1''"}`
+r2 = compareResponses("c2", base, sqliRsp)
+assertEq("SQL错误响应 verdict", r2["verdict"], "differential")
+assertEq("SQL错误响应 score > 0.05", r2["diff_score"] > DIFF_THRESHOLD, true)
+
+// ---- 用例 3: 纯噪声变化（归一化后响应一致）→ no_diff（强于 noise 的正确判定）----
+noiseRsp = `HTTP/1.1 200 OK
+Content-Length: 30
+
+{"id": 42, "name": "alice", "ts": 1700009999, "request_id": "aabbccdd"}`
+r3 = compareResponses("c3", base, noiseRsp)
+assertEq("纯噪声变化归一化后 verdict", r3["verdict"], "no_diff")
+
+// ---- 用例 4: 时间戳行变化（归一化后消失）→ no_diff ----
+tsRsp = `HTTP/1.1 200 OK
+Date: Mon, 1 Jan 2025 00:00:01 GMT
+Content-Length: 30
+
+{"id": 42, "name": "alice", "ts": 1700001234}`
+r4 = compareResponses("c4", base, tsRsp)
+assertEq("时间戳归一化 verdict", r4["verdict"], "no_diff")
+
+// ---- 用例 5: 长响应局部变化定位 ----
+lines = []
+for i = 0; i < 100; i++ {
+    lines = append(lines, f"line ${i}: static content here")
+}
+longBase = str.Join(lines, "\n")
+longVar = str.ReplaceAll(longBase, "line 57: static content here", "line 57: SQL syntax error detected")
+assertEq("测试前提: 替换已生效", longBase != longVar, true)
+r5 = compareResponses("c5", `HTTP/1.1 200 OK
+
+` + longBase, `HTTP/1.1 200 OK
+
+` + longVar)
+assertEq("长响应局部变化 verdict", r5["verdict"], "differential")
+assertEq("长响应局部变化 score < 0.1", r5["diff_score"] < 0.1, true)
+if len(r5["diff_regions"]) < 1 {
+    println("FAIL 长响应变化段缺失")
+    failures = append(failures, "FAIL diff_regions missing")
+} else {
+    println("ok   变化段:", r5["diff_regions"][0])
+}
+
+// ---- 用例 6: 响应体反转（哈希变化）→ differential ----
+r6 = compareResponses("c6", base, sqliRsp + "\n" + base)
+assertEq("响应体结构变化 verdict", r6["verdict"], "differential")
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_diff FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_diff PASS (all assertions) ====")

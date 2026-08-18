@@ -1,0 +1,90 @@
+// test_dedup.yak — 去重模块单元测试
+// 运行: cd src && yak ../test/test_dedup.yak
+//
+// 用例：
+// 1. 20 条同构流量（同 path 同参数集合，参数值/时间戳不同）→ 应折叠为 1 条
+// 2. 5 条异构流量（不同 path / 不同参数集合）→ 保留 5 条
+// 3. 噪声参数（timestamp/nonce）不参与指纹
+// 4. 参数值不参与指纹（同参数名不同值 → 同构）
+
+include "traffic/dedup.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+
+// ---- 用例 1: 20 条同构流量折叠 ----
+dedup = newDeduplicator()
+for i = 0; i < 20; i++ {
+    fp = computeFingerprint("GET", f"http://api.example.com/user/list?_t={i*7+3}&page=1&size=10&ts=170000000{i % 10}", {
+        "page": "1",
+        "size": "10",
+        "_t": string(i * 7 + 3),
+        "ts": f"170000000{i % 10}",
+    })
+    dedupSeen(dedup, fp)
+}
+uniq, total = dedupStats(dedup)
+assertEq("20条同构流量去重后唯一数", uniq, 1)
+assertEq("20条同构流量总命中数", total, 20)
+
+// ---- 用例 2: 5 条异构流量保留 ----
+dedup2 = newDeduplicator()
+hetero = [
+    ["GET", "http://api.example.com/user/list", {"page": "1"}],
+    ["GET", "http://api.example.com/user/detail", {"id": "42"}],
+    ["POST", "http://api.example.com/user/update", {"id": "42"}],
+    ["GET", "http://api.example.com/order/list", {"page": "1", "status": "paid"}],
+    ["GET", "http://api.example.com/user/list", {"page": "1", "keyword": "a"}],
+]
+for h in hetero {
+    fp = computeFingerprint(h[0], h[1], h[2])
+    dedupSeen(dedup2, fp)
+}
+uniq2, _ = dedupStats(dedup2)
+assertEq("5条异构流量保留数", uniq2, 5)
+
+// ---- 用例 3: 噪声参数不参与指纹 ----
+fa = computeFingerprint("GET", "http://api.example.com/x?ts=111", {"id": "1", "ts": "111"})
+fb = computeFingerprint("GET", "http://api.example.com/x?ts=222", {"id": "1", "ts": "222"})
+assertEq("时间戳参数剥离后指纹一致", fa == fb, true)
+
+fc = computeFingerprint("GET", "http://api.example.com/x?nonce=aaa", {"id": "1", "nonce": "aaa"})
+fd = computeFingerprint("GET", "http://api.example.com/x?nonce=bbb", {"id": "1", "nonce": "bbb"})
+assertEq("nonce参数剥离后指纹一致", fc == fd, true)
+
+// ---- 用例 4: 参数值不参与指纹 ----
+fe = computeFingerprint("GET", "http://api.example.com/user/detail", {"id": "42"})
+ff = computeFingerprint("GET", "http://api.example.com/user/detail", {"id": "100"})
+assertEq("同参数不同值视为同构", fe == ff, true)
+
+// ---- 用例 5: 参数类型参与指纹 ----
+fg = computeFingerprint("GET", "http://api.example.com/x", {"id": "42"})
+fh = computeFingerprint("GET", "http://api.example.com/x", {"id": "abc"})
+assertEq("参数类型不同视为异构", fg == fh, false)
+
+// ---- 用例 6: 100 条同构 → ≤10 条（验收指标）----
+dedup3 = newDeduplicator()
+for i = 0; i < 100; i++ {
+    fp = computeFingerprint("GET", f"http://api.example.com/user/list?_t={i}&page=1", {
+        "page": "1",
+        "_t": string(i),
+    })
+    dedupSeen(dedup3, fp)
+}
+uniq3, _ = dedupStats(dedup3)
+assertEq("100条同构去重后 ≤10 条", uniq3 <= 10, true)
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_dedup FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_dedup PASS (all assertions) ====")

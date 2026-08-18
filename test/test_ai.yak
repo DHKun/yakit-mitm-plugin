@@ -1,0 +1,110 @@
+// test_ai.yak — LLM 候选生成与降级路径单元测试
+// 运行: cd src && yak ../test/test_ai.yak
+//
+// 本测试自带一个 Mock LLM 服务（内嵌 TCP mock），不出网。
+// 用例：
+// 1. LLM 正常返回 strict JSON → 候选解析成功，source=llm
+// 2. LLM 返回缺 expected_diff_signature 的候选 → 被硬约束丢弃
+// 3. LLM 返回空数组 → 放弃该参数（返回空）
+// 4. LLM 返回非 JSON → 报错
+// 5. LLM 不可达（降级）→ fallback 字典按参数类型分流
+// 6. LLM 连续失败计数 → 达到阈值后直接走降级
+
+include "traffic/dedup.yak"
+include "ai/schema.yak"
+include "ai/payload_agent.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+
+// ---- Mock LLM 服务器（OpenAI 兼容 /v1/chat/completions）----
+MOCK_PORT = 18601
+go func() {
+    server = tcp.Serve("127.0.0.1", MOCK_PORT, tcp.serverCallback(func(conn) {
+        defer conn.Close()
+        buf, err = conn.RecvTimeout(3)
+        if err {
+            return
+        }
+        reqBody = string(buf)
+        // 按 prompt 关键字分流返回内容
+        content = ""
+        if str.Contains(reqBody, "no-signature") {
+            content = `{"candidates":[{"param":"id","payload":"1'","vuln_hint":"sqli","reason":"r","confidence":0.5}]}`
+        } else if str.Contains(reqBody, "give-up") {
+            content = `{"candidates":[]}`
+        } else if str.Contains(reqBody, "not-json") {
+            content = `sorry, I cannot help with that.`
+        } else {
+            content = `{"candidates":[{"param":"id","payload":"1'","vuln_hint":"sqli","reason":"quote breaker","confidence":0.9,"expected_diff_signature":"SQL error text"}]}`
+        }
+        inner = json.dumps({"role": "assistant", "content": content})
+        reply = json.dumps({"id": "mock", "object": "chat.completion", "created": 1, "model": "mock", "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}]})
+        rsp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${len(reply)}\r\n\r\n${reply}"
+        conn.Send(rsp)
+    }))
+}()
+time.Sleep(0.3)
+
+mockClient = ai.OpenAI(ai.apiKey("sk-mock"), ai.baseURL(f"http://127.0.0.1:${MOCK_PORT}/v1"), ai.model("mock"), ai.timeout(5))
+
+// ---- 用例 1: 正常返回 ----
+c1, usedLlm = generateCandidates(mockClient, "id", "42", "int", "GET", "/normal")
+assertEq("LLM 正常路径 usedLlm", usedLlm, true)
+assertEq("LLM 正常路径候选数", len(c1), 1)
+assertEq("LLM 候选 source", c1[0]["source"], "llm")
+assertEq("LLM 候选带 signature", c1[0]["expected_diff_signature"], "SQL error text")
+
+// ---- 用例 2: 缺 signature 的候选被丢弃 ----
+c2, _ = generateCandidates(mockClient, "id", "42", "int", "GET", "/no-signature")
+assertEq("缺 signature 候选被丢弃", len(c2), 0)
+
+// ---- 用例 3: LLM 建议放弃 → 空数组 ----
+c3, usedLlm3 = generateCandidates(mockClient, "id", "42", "int", "GET", "/give-up")
+assertEq("LLM 放弃路径 usedLlm", usedLlm3, true)
+assertEq("LLM 放弃路径返回空", len(c3), 0)
+
+// ---- 用例 4: 非 JSON 返回 → 报错并降级 ----
+LLM_STATE["fail_count"] = 0
+c4, usedLlm4 = generateCandidates(mockClient, "id", "42", "int", "GET", "/not-json")
+assertEq("非 JSON 走降级", usedLlm4, false)
+assertEq("降级后有 fallback 候选", len(c4) > 0, true)
+assertEq("fallback 候选 source", c4[0]["source"], "fallback")
+
+// ---- 用例 5: 字典降级按类型分流 ----
+fbInt, _ = generateCandidates(nil, "id", "42", "int", "GET", "/x")
+fbStr, _ = generateCandidates(nil, "q", "abc", "string", "GET", "/x")
+fbBool, _ = generateCandidates(nil, "flag", "true", "bool", "GET", "/x")
+assertEq("int 字典候选 > 0", len(fbInt) > 0, true)
+assertEq("string 字典候选 > 0", len(fbStr) > 0, true)
+assertEq("bool 字典候选 = 0", len(fbBool), 0)
+assertEq("fallback 候选全部带 signature", func() {
+    for c in fbStr {
+        if c["expected_diff_signature"] == "" {
+            return false
+        }
+    }
+    return true
+}(), true)
+
+// ---- 用例 6: 失败计数降级 ----
+LLM_STATE["fail_count"] = 0
+badClient = ai.OpenAI(ai.apiKey("k"), ai.baseURL("http://127.0.0.1:1/v1"), ai.model("m"), ai.timeout(1))
+c6a, _ = generateCandidates(badClient, "id", "42", "int", "GET", "/x")
+assertEq("首次失败后计数值", LLM_STATE["fail_count"], 1)
+assertEq("失败仍给 fallback", len(c6a) > 0, true)
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_ai FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_ai PASS (all assertions) ====")

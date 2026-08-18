@@ -1,0 +1,91 @@
+// test_e2e.yak — 状态机端到端集成测试
+// 运行: cd src && yak ../test/test_e2e.yak
+//
+// 内嵌一个"易受攻击"的 Mock 目标（quote 注入 → SQL 错误回显），不出网。
+// 验证完整链路: 截获 → 去重 → 剪枝 → 候选生成 → 重放 → Diff 判定 → 面板分流
+//
+// 用例：
+// 1. 注入型 payload 触发 SQL 错误 → verdict=differential，verified_diff 计数 +1
+// 2. 无害 payload 响应不变 → verdict=no_diff
+// 3. 同构流量第二次截获 → 被去重跳过（kept_unique 不增长）
+// 4. 黑名单参数（csrf/session）不进入候选生成
+// 5. LLM 未配置 → 走 fallback 字典（source=fallback）
+
+include "main.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+
+// ---- Mock 易受攻击目标 ----
+// 行为: id 参数包含单引号 → 返回 SQL 错误回显；其余情况返回正常 JSON
+go func() {
+    server = tcp.Serve("127.0.0.1", 18700, tcp.serverCallback(func(conn) {
+        defer conn.Close()
+        buf, err = conn.RecvTimeout(3)
+        if err {
+            return
+        }
+        packet = string(buf)
+        idParam = poc.GetHTTPPacketQueryParam(packet, "id")
+        body = `{"id": 42, "name": "alice"}`
+        if str.Contains(idParam, "'") {
+            body = `{"err": "You have an error in your SQL syntax near '1''"}`
+        }
+        rsp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${len(body)}\r\n\r\n${body}"
+        conn.Send(rsp)
+    }))
+}()
+time.Sleep(0.3)
+
+target = "http://127.0.0.1:18700"
+
+// ---- 用例 1+2+5: 首次截获 → 完整链路 ----
+url1 = target + "/api/user?id=42&csrf_token=abc&session_id=xyz"
+isHttps, req1, _ = poc.ParseUrlToHTTPRequestRaw("GET", url1)
+rsp1, _, _ = poc.HTTP(string(req1))
+processFlow(false, url1, string(req1), string(rsp1))
+time.Sleep(2)
+
+assertEq("截获计数", SENSOR_STATE["seen_total"], 1)
+assertEq("去重保留", SENSOR_STATE["kept_unique"], 1)
+// 剪枝: csrf_token + session_id 被剪掉，只剩 id → int fallback 字典 4 条被单参数上限截为 3
+assertEq("剪枝后仅 id 参数进入候选（受单参数上限截断）", SENSOR_STATE["candidates_gen"], 3)
+// 其中 1' 触发 SQL 错误 → differential
+assertEq("注入 payload 实证差异计数", SENSOR_STATE["verified_diff"], 1)
+
+// ---- 用例 3: 同构流量去重 ----
+url2 = target + "/api/user?id=100&csrf_token=def&session_id=zzz"
+isHttps, req2, _ = poc.ParseUrlToHTTPRequestRaw("GET", url2)
+rsp2, _, _ = poc.HTTP(string(req2))
+processFlow(false, url2, string(req2), string(rsp2))
+time.Sleep(0.5)
+assertEq("同构流量被去重（截获计数 +1）", SENSOR_STATE["seen_total"], 2)
+assertEq("同构流量不产生新候选", SENSOR_STATE["candidates_gen"], 3)
+
+// ---- 用例 4: 黑名单参数不进入候选生成 ----
+// url1 已含 csrf_token/session_id 且确实未生成对应候选（candidates_gen 全部来自 id 参数）
+// 上面断言已覆盖，这里再显式验证剪枝函数行为：
+kept, pruned, total = pruneParams({"id": "1", "csrf_token": "a", "session_id": "b"})
+assertEq("黑名单剪除计数", pruned, 2)
+assertEq("黑名单剪除后仅剩 id", len(kept), 1)
+
+// ---- 用例 5: fallback 来源 ----
+// LLM 未配置（本测试没有设置 base_url）→ 走 fallback
+cands, usedLlm = generateCandidates(SENSOR_STATE["llm_client"], "id", "42", "int", "GET", "/api/user")
+assertEq("LLM 未配置走降级", usedLlm, false)
+assertEq("降级候选 source", cands[0]["source"], "fallback")
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_e2e FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_e2e PASS (all assertions) ====")
