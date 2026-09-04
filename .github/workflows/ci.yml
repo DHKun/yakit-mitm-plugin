@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      YAK_VERSION: 1.4.8-beta15
+      YAK_SHA256: 5ab0c3af949ccbe228e1b79d34aed4d8b53d187c2bc1a057d3186a23542aa3b2
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install verified Yak runtime
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          asset="yak-slim_linux_amd64"
+          base="https://github.com/yaklang/yaklang/releases/download/${YAK_VERSION}"
+          curl --fail --location --retry 3 "${base}/${asset}" --output "${RUNNER_TEMP}/yak"
+          actual="$(sha256sum "${RUNNER_TEMP}/yak" | cut -d ' ' -f 1)"
+          test "${actual}" = "${YAK_SHA256}"
+          chmod +x "${RUNNER_TEMP}/yak"
+          echo "${RUNNER_TEMP}" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/yak" version
+
+      - name: Check test runner
+        run: shellcheck test/run_all.sh
+
+      - name: Run test suite
+        run: bash test/run_all.sh
+
+      - name: Build plugin archive
+        run: zip -r yakit-mitm-plugin.zip src README.md CHANGELOG.md LICENSE
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: yakit-mitm-plugin
+          path: yakit-mitm-plugin.zip
+          if-no-files-found: error

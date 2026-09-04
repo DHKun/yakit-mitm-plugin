@@ -1,0 +1,357 @@
+// sensor_runtime.yak — SensorRuntime 并发运行时（P0-2）
+//
+// 设计约束（对应 agent.md 的并发三原则）：
+//   1. MITM hook 只做非阻塞提交（rtSubmit 满即丢，永不阻塞、永不派生 goroutine）；
+//   2. 所有共享可变状态并发安全；
+//   3. worker 内部 panic 被 try/catch 捕获并计入 metrics，不会让进程静默退出。
+//
+// 所有主动重放（baseline/variant/control）必须经 rtConsumeBudget 扣减统一预算；
+// 所有重放目标必须先过 rtInScope（scope allowlist 或保留地址黑名单）+
+// rtMethodAllowed（GET/POST 白名单）+ rtAllowOrigin（per-origin 限流）。
+//
+// yak 并发模型（本文件所有代码必须遵守，均经探针验证）：
+//   A. rt 顶层 key 只在构造函数内写入，构造后全模块零写入 → 任意 goroutine
+//      锁外读取永远安全。反过来，任何"构造后写 rt 顶层 key"都会触发
+//      `fatal error: concurrent map read and map write`（Go 运行时致命错，
+//      try/catch 无法捕获，进程直接退出）—— 严禁。
+//   B. 所有可变状态（jobs_store/metrics/budget/buckets/started/stopped/handler）
+//      全部收进 rt["st"]（sync.NewMap）。Go 原生 sync.Map 的 Load/Store 天然
+//      并发安全，永不触发 fatal error；注意 Load 返回 [value, ok] 元组，取 [0]。
+//   C. sync.Map 不提供原子 read-modify-write，计数类更新必须持锁：
+//      metrics 用 metrics_mu，budget 用 budget_mu，buckets 用 buckets_mu，
+//      队列生命周期（检查满/send/close/stopped）统一用 jobs_mu。
+//      钳制在锁内的嵌套 map 原地写是安全的；锁外并发写同一 map 必 fatal。
+//   D. *sync.Mutex 可存入 map/sync.Map 并正常调用（早期"容器退化"结论是
+//      误判，真因是 undefined 值上取方法）。但为最小化锁传播，这里所有锁
+//      仍挂在 rt 顶层，worker 通过闭包捕获局部引用使用。
+//   E. channel 只传递递增 job id，实际 job 放在 sync.Map jobs_store 中；
+//      worker 取出后立即 Delete，因此队列与后备存储都保持有界。
+//
+// yak 运行时注意：
+//   - 不支持 select；worker 用 `idx, ok = <- ch; if !ok { break }`；
+//   - 无类型 chan 不能携带 map（编译错误/panic），jobs 用 chan int 索引 jobs_arr；
+//   - goroutine panic 会让进程以 0 退出，worker 循环体必须 try/catch 兜底。
+
+// ---- 配置默认值 ----
+RUNTIME_DEFAULTS = {
+    "workers": 2,
+    "queue_size": 256,
+    "replay_budget": 200,
+    "rate_per_origin": 5,
+    "rate_interval_ms": 1000,
+    "max_origins": 256,
+    "scope_hosts": "",
+}
+
+// ---- 构造（rt 顶层唯一允许写入的位置）----
+newSensorRuntime = func(cfg) {
+    if cfg == undefined {
+        cfg = {}
+    }
+    rt = {}
+    for k in RUNTIME_DEFAULTS {
+        v = cfg[k]
+        if v != undefined && v != false && v != "" {
+            rt["cfg_" + k] = v
+        } else {
+            rt["cfg_" + k] = RUNTIME_DEFAULTS[k]
+        }
+    }
+    rt["cfg_replay_budget"] = int(rt["cfg_replay_budget"])
+    rt["cfg_workers"] = int(rt["cfg_workers"])
+    rt["cfg_queue_size"] = int(rt["cfg_queue_size"])
+    rt["cfg_rate_per_origin"] = int(rt["cfg_rate_per_origin"])
+    rt["cfg_rate_interval_ms"] = int(rt["cfg_rate_interval_ms"])
+    rt["cfg_max_origins"] = int(rt["cfg_max_origins"])
+    if rt["cfg_workers"] < 1 {
+        rt["cfg_workers"] = 1
+    }
+    if rt["cfg_queue_size"] < 1 {
+        rt["cfg_queue_size"] = 1
+    }
+    if rt["cfg_max_origins"] < 1 {
+        rt["cfg_max_origins"] = 1
+    }
+
+    // scope allowlist：逗号分隔 host 小写集合；空 = 无 allowlist（走保留地址黑名单）
+    scopeSet = {}
+    scopeRaw = str.TrimSpace(string(rt["cfg_scope_hosts"]))
+    if scopeRaw != "" {
+        for p in str.Split(scopeRaw, ",") {
+            h = str.ToLower(str.TrimSpace(p))
+            if h != "" {
+                scopeSet[h] = true
+            }
+        }
+    }
+    rt["scope_set"] = scopeSet
+    rt["has_scope"] = len(scopeSet) > 0
+
+    // 有界任务队列：chan int 传 job id，sync.Map 保存实际 job。
+    // jobs_store 只保留排队中/处理中任务，worker 取出后立即删除。
+    rt["jobs"] = make(chan int, rt["cfg_queue_size"])
+
+    // 可变状态分区（规则 B）
+    st = sync.NewMap()
+    st.Store("jobs_store", sync.NewMap())
+    st.Store("next_job_id", 0)
+    st.Store("metrics", {
+        "jobs_submitted": 0,
+        "jobs_processed": 0,
+        "jobs_dropped": 0,
+        "jobs_failed": 0,
+        "replays_used": 0,
+        "replays_rejected": 0,
+    })
+    st.Store("budget_left", rt["cfg_replay_budget"])
+    st.Store("buckets", sync.NewMap())
+    st.Store("bucket_order", [])
+    st.Store("started", false)
+    st.Store("stopped", false)
+    st.Store("handler", undefined)
+    rt["st"] = st
+
+    // 锁分区（规则 C）：队列生命周期 / metrics / 预算 / 限流桶各一把
+    rt["jobs_mu"] = sync.NewMutex()
+    rt["metrics_mu"] = sync.NewMutex()
+    rt["budget_mu"] = sync.NewMutex()
+    rt["buckets_mu"] = sync.NewMutex()
+
+    // worker 编排
+    rt["wg"] = sync.NewWaitGroup()
+    return rt
+}
+
+// ---- 内部工具 ----
+// metrics 计数自增（规则 C：必须持 metrics_mu 保证 read-modify-write 原子）
+rtIncMetric = func(rt, key, n) {
+    rt["metrics_mu"].Lock()
+    m = rt["st"].Load("metrics")[0]
+    m[key] = m[key] + n
+    rt["metrics_mu"].Unlock()
+}
+
+rtExtractHost = func(u) {
+    m = re.FindSubmatch(u, `^[a-zA-Z][a-zA-Z0-9+.-]*://(\[[^\]]+\]|[^/:]+)`)
+    if m != undefined && len(m) >= 2 {
+        return str.ToLower(m[1])
+    }
+    return ""
+}
+
+rtIsReservedHost = func(host) {
+    h = host
+    if str.HasPrefix(h, "[") && str.HasSuffix(h, "]") {
+        h = h[1:len(h)-1]
+    }
+    if h == "localhost" || h == "0.0.0.0" {
+        return true
+    }
+    if re.Match(`^(?:127\.|10\.|192\.168\.|169\.254\.|172\.(?:1[6-9]|2\d|3[01])\.|0\.|100\.6[4-9]\.|100\.[7-9]\d\.|100\.1[01]\d\.|100\.12[0-7]\.)`, h) {
+        return true
+    }
+    if re.Match(`^(?:::1|f[cd][0-9a-f]{2}:|fe80:)`, h) {
+        return true
+    }
+    return false
+}
+
+// worker 主循环：只使用闭包捕获的引用，不触碰 rt map 本身。
+// 持锁范围刻意最小化：仅取任务快照时短暂持有 jobs_mu，handler 在锁外执行，
+// 保证慢 handler 不阻塞 submit/close。
+rtWorkerLoop = func(jobsRef, stRef, jobsMu, metricsMu) {
+    for {
+        idx, ok = <- jobsRef
+        if !ok {
+            break
+        }
+        jobsMu.Lock()
+        jobsStore = stRef.Load("jobs_store")[0]
+        job = jobsStore.Load(idx)[0]
+        jobsStore.Delete(idx)
+        handler = stRef.Load("handler")[0]
+        jobsMu.Unlock()
+        if handler != undefined {
+            try {
+                handler(job)
+            } catch e {
+                yakit.Warn(f"[runtime] job panic recovered: ${e}")
+                metricsMu.Lock()
+                m = stRef.Load("metrics")[0]
+                m["jobs_failed"] = m["jobs_failed"] + 1
+                metricsMu.Unlock()
+            }
+        }
+        metricsMu.Lock()
+        m = stRef.Load("metrics")[0]
+        m["jobs_processed"] = m["jobs_processed"] + 1
+        metricsMu.Unlock()
+    }
+}
+
+// ---- 提交（hook 唯一入口；非阻塞，满即丢）----
+rtSetHandler = func(rt, handler) {
+    rt["st"].Store("handler", handler)
+}
+
+rtSubmit = func(rt, job) {
+    jobsMu = rt["jobs_mu"]
+    stRef = rt["st"]
+    jobsRef = rt["jobs"]
+    jobsMu.Lock()
+    if stRef.Load("stopped")[0] {
+        jobsMu.Unlock()
+        return false
+    }
+    if len(jobsRef) >= cap(jobsRef) {
+        jobsMu.Unlock()
+        rtIncMetric(rt, "jobs_dropped", 1)
+        return false
+    }
+    idx = int(stRef.Load("next_job_id")[0]) + 1
+    stRef.Store("next_job_id", idx)
+    stRef.Load("jobs_store")[0].Store(idx, job)
+    jobsRef <- idx
+    jobsMu.Unlock()
+    rtIncMetric(rt, "jobs_submitted", 1)
+    return true
+}
+
+// ---- 启停 ----
+rtStart = func(rt) {
+    jobsMu = rt["jobs_mu"]
+    stRef = rt["st"]
+    jobsMu.Lock()
+    if stRef.Load("started")[0] || stRef.Load("stopped")[0] {
+        jobsMu.Unlock()
+        return
+    }
+    stRef.Store("started", true)
+    jobsMu.Unlock()
+    // 闭包捕获局部引用（规则 A：goroutine 内不读 rt 以外的可变态）
+    jobsRef = rt["jobs"]
+    wg = rt["wg"]
+    metricsMu = rt["metrics_mu"]
+    nWorkers = rt["cfg_workers"]
+    for i = 0; i < nWorkers; i++ {
+        wg.Add(1)
+        go func() {
+            defer wg.Done()
+            rtWorkerLoop(jobsRef, stRef, jobsMu, metricsMu)
+        }()
+    }
+}
+
+rtStop = func(rt) {
+    jobsMu = rt["jobs_mu"]
+    stRef = rt["st"]
+    started = false
+    jobsMu.Lock()
+    alreadyStopped = stRef.Load("stopped")[0]
+    started = stRef.Load("started")[0]
+    if !alreadyStopped {
+        stRef.Store("stopped", true)
+        if started {
+            close(rt["jobs"])
+        }
+    }
+    jobsMu.Unlock()
+    if started {
+        rt["wg"].Wait()
+    }
+}
+
+rtMetrics = func(rt) {
+    rt["metrics_mu"].Lock()
+    src = rt["st"].Load("metrics")[0]
+    m = {}
+    for k in src {
+        m[k] = src[k]
+    }
+    rt["metrics_mu"].Unlock()
+    return m
+}
+
+// ---- 统一重放预算 ----
+// purpose: "baseline" | "variant" | "control" — 供调用方审计，预算本身不区分用途
+rtConsumeBudget = func(rt, purpose, n) {
+    if n < 1 {
+        n = 1
+    }
+    rt["budget_mu"].Lock()
+    left = rt["st"].Load("budget_left")[0]
+    if left < n {
+        rt["budget_mu"].Unlock()
+        rtIncMetric(rt, "replays_rejected", n)
+        return false
+    }
+    rt["st"].Store("budget_left", left - n)
+    rt["budget_mu"].Unlock()
+    rtIncMetric(rt, "replays_used", n)
+    return true
+}
+
+// ---- per-origin 限流（令牌桶）----
+// 所有 bucket 读写统一在 buckets_mu 内；容量满时按插入顺序淘汰旧 origin。
+rtAllowOrigin = func(rt, url) {
+    host = rtExtractHost(url)
+    if host == "" {
+        return false
+    }
+    rate = float(rt["cfg_rate_per_origin"])
+    interval = float(rt["cfg_rate_interval_ms"])
+    rt["buckets_mu"].Lock()
+    buckets = rt["st"].Load("buckets")[0]
+    b = buckets.Load(host)[0]
+    if b == undefined {
+        order = rt["st"].Load("bucket_order")[0]
+        if len(order) >= int(rt["cfg_max_origins"]) {
+            buckets.Delete(order[0])
+            order = order[1:]
+        }
+        b = {"tokens": rate, "last": time.Now().UnixMilli()}
+        buckets.Store(host, b)
+        rt["st"].Store("bucket_order", append(order, host))
+    }
+    now = time.Now().UnixMilli()
+    elapsed = float(now - b["last"])
+    if elapsed > 0 {
+        b["tokens"] = b["tokens"] + elapsed / interval * rate
+        if b["tokens"] > rate {
+            b["tokens"] = rate
+        }
+        b["last"] = now
+    }
+    ok = false
+    if b["tokens"] >= 1.0 {
+        b["tokens"] = b["tokens"] - 1.0
+        ok = true
+    }
+    rt["buckets_mu"].Unlock()
+    return ok
+}
+
+// ---- scope 判定 ----
+// 有 allowlist：仅 allowlist 内 host 放行（精确匹配，不做子串/后缀匹配，防 127.0.0.1.evil.com 绕过）
+// 无 allowlist：拒绝保留/内网/元数据地址，放行其余（MITM 场景目标即用户浏览的站点）
+rtInScope = func(rt, url) {
+    host = rtExtractHost(url)
+    if host == "" {
+        return false
+    }
+    if rt["has_scope"] {
+        return host in rt["scope_set"]
+    }
+    return !rtIsReservedHost(host)
+}
+
+// ---- method 白名单 ----
+rtMethodAllowed = func(rt, method) {
+    if str.EqualFold(method, "GET") {
+        return true
+    }
+    if str.EqualFold(method, "POST") {
+        return true
+    }
+    return false
+}

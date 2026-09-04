@@ -9,6 +9,9 @@
 // 4. LLM 返回非 JSON → 报错
 // 5. LLM 不可达（降级）→ fallback 字典按参数类型分流
 // 6. LLM 连续失败计数 → 达到阈值后直接走降级
+// 7. payload 清洗：CRLF/控制字符剥离、长度截断（原则 5：AI 输出不得作为无约束输入）
+// 8. vuln_hint 白名单归一化：未知 hint → unknown（原则 6：证据与类型必须匹配）
+// 9. 超长 payload 候选被丢弃
 
 include "traffic/dedup.yak"
 include "ai/schema.yak"
@@ -23,6 +26,9 @@ assertEq = func(desc, got, want) {
     } else {
         println("ok  ", desc)
     }
+}
+assertFalse = func(desc, cond) {
+    assertEq(desc, cond, false)
 }
 
 // ---- Mock LLM 服务器（OpenAI 兼容 /v1/chat/completions）----
@@ -43,6 +49,14 @@ go func() {
             content = `{"candidates":[]}`
         } else if str.Contains(reqBody, "not-json") {
             content = `sorry, I cannot help with that.`
+        } else if str.Contains(reqBody, "dirty-payload") {
+            content = `{"candidates":[{"param":"id","payload":"1'\r\n\tX-Control: y\r\n\nGET /","vuln_hint":"SQLI","reason":"dirty","confidence":0.5,"expected_diff_signature":"SQL error text"}]}`
+        } else if str.Contains(reqBody, "huge-payload") {
+            big = ""
+            for i = 0; i < 600; i++ {
+                big = big + "A"
+            }
+            content = json.dumps({"candidates": [{"param": "id", "payload": big, "vuln_hint": "sqli", "reason": "huge", "confidence": 0.5, "expected_diff_signature": "SQL error text"}]})
         } else {
             content = `{"candidates":[{"param":"id","payload":"1'","vuln_hint":"sqli","reason":"quote breaker","confidence":0.9,"expected_diff_signature":"SQL error text"}]}`
         }
@@ -101,6 +115,29 @@ badClient = ai.OpenAI(ai.apiKey("k"), ai.baseURL("http://127.0.0.1:1/v1"), ai.mo
 c6a, _ = generateCandidates(badClient, "id", "42", "int", "GET", "/x")
 assertEq("首次失败后计数值", LLM_STATE["fail_count"], 1)
 assertEq("失败仍给 fallback", len(c6a) > 0, true)
+
+// ---- 用例 7: payload 清洗（原则 5：AI 输出不得作为无约束输入）----
+c7, _ = generateCandidates(mockClient, "id", "42", "int", "GET", "/dirty-payload")
+assertEq("dirty 候选存活", len(c7), 1)
+p7 = c7[0]["payload"]
+assertFalse("payload 不含 \r", str.Contains(p7, "\r"))
+assertFalse("payload 不含 \n", str.Contains(p7, "\n"))
+assertFalse("payload 不含 \t", str.Contains(p7, "\t"))
+
+san = sanitizePayload("a\r\n\tb\x01c\x7f")
+assertEq("sanitizePayload 剥控制字符", san, "abc")
+assertEq("sanitizePayload 截断超长", len(sanitizePayload(str.Repeat("A", 5000))), MAX_PAYLOAD_LEN)
+
+// ---- 用例 8: vuln_hint 白名单归一化 ----
+assertEq("SQLI 大写归一化", c7[0]["vuln_hint"], "sqli")
+assertEq("normalizeHint 白名单外→unknown", normalizeHint("rce-ish"), "unknown")
+assertEq("normalizeHint 空值→unknown", normalizeHint(""), "unknown")
+assertEq("normalizeHint sqli 透传", normalizeHint(" sqli "), "sqli")
+
+// ---- 用例 9: 超长 payload 候选被丢弃 ----
+LLM_STATE["fail_count"] = 0
+c9, _ = generateCandidates(mockClient, "id", "42", "int", "GET", "/huge-payload")
+assertEq("超长 payload 候选被丢弃", len(c9), 0)
 
 // ---- 汇总 ----
 if len(failures) > 0 {

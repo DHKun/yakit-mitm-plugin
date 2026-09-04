@@ -97,41 +97,69 @@ computeFingerprint = func(method, url, params) {
     return codec.Md5(raw)
 }
 
-// newDeduplicator 创建一个新的去重器实例（线程安全，跨流量保持状态）
-// seen: 指纹 → 首次出现时间；count: 指纹 → 累计出现次数
+// 去重窗口默认保留 10,000 个指纹、每个指纹 1 小时；容量满时按插入顺序淘汰。
+// 两个常量可在测试或入口初始化阶段重绑定。
+DEDUP_MAX_ENTRIES = 10000
+DEDUP_TTL_SECONDS = 3600
+
+// newDeduplicator 创建线程安全且有界的去重器。
 newDeduplicator = func() {
     return {
-        "seen": sync.NewMap(),
-        "count": sync.NewMap(),
+        "entries": sync.NewMap(),
+        "order": [],
+        "max_entries": DEDUP_MAX_ENTRIES,
+        "ttl_seconds": DEDUP_TTL_SECONDS,
+        "mu": sync.NewMutex(),
     }
 }
 
 // dedupSeen 判断指纹是否已见过；未见过的指纹会被登记
 // 返回 [是否重复(bool), 该指纹累计出现次数(int)]
 dedupSeen = func(dedup, fingerprint) {
-    _, loaded = dedup["seen"].LoadOrStore(fingerprint, time.Now().Unix())
-    cnt = 1
-    if loaded {
-        prev, _ = dedup["count"].Load(fingerprint)
-        if prev != undefined {
-            cnt = int(prev) + 1
+    dedup["mu"].Lock()
+    now = time.Now().Unix()
+    entries = dedup["entries"]
+    entry = entries.Load(fingerprint)[0]
+    if entry != undefined {
+        if now - int(entry["first_seen"]) <= int(dedup["ttl_seconds"]) {
+            entry["count"] = int(entry["count"]) + 1
+            entry["last_seen"] = now
+            cnt = entry["count"]
+            dedup["mu"].Unlock()
+            return true, cnt
         }
-        dedup["count"].Store(fingerprint, cnt)
-        return true, cnt
+        entries.Delete(fingerprint)
+        oldOrder = dedup["order"]
+        keptOrder = []
+        for fp in oldOrder {
+            if fp != fingerprint {
+                keptOrder = append(keptOrder, fp)
+            }
+        }
+        dedup["order"] = keptOrder
     }
-    dedup["count"].Store(fingerprint, cnt)
-    return false, cnt
+
+    order = dedup["order"]
+    if len(order) >= int(dedup["max_entries"]) {
+        entries.Delete(order[0])
+        order = order[1:]
+    }
+    entries.Store(fingerprint, {"first_seen": now, "last_seen": now, "count": 1})
+    dedup["order"] = append(order, fingerprint)
+    dedup["mu"].Unlock()
+    return false, 1
 }
 
 // dedupStats 统计去重器状态：[已登记指纹数, 总命中次数]
 dedupStats = func(dedup) {
+    dedup["mu"].Lock()
     uniq = 0
     total = 0
-    counter = dedup["count"]
-    counter.Range(func(k, v) {
+    dedup["entries"].Range(func(k, v) {
         uniq = uniq + 1
-        total = total + int(v)
+        total = total + int(v["count"])
         return true
     })
+    dedup["mu"].Unlock()
     return uniq, total
 }

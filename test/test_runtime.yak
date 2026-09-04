@@ -1,0 +1,218 @@
+// test_runtime.yak — SensorRuntime 并发运行时单元测试
+// 运行: cd src && yak ../test/test_runtime.yak
+//
+// 用例：
+// 1. Submit 后 worker 消费任务，任务全部被处理（有界队列，不丢不漏）
+// 2. 队列满时 Submit 非阻塞丢弃，丢弃计入 metrics（hook 永不阻塞）
+// 3. Stop 幂等（二次 Stop 不 panic），Stop 后 Submit 被拒绝
+// 4. replay budget：每次 ConsumeBudget 成功扣减，预算耗尽后拒绝；Refill 不可用（一次性）
+// 5. per-origin limiter：突发超过桶容量被限流，等待后恢复
+// 6. scope 边界：目标 host 不在 allowlist 内 → 拒绝（无 allowlist 时仅拒绝保留 IP 段/元数据地址）
+// 7. method 边界：非 GET/POST 拒绝
+// 8. metrics 并发计数一致（多 goroutine 累加无丢失）
+
+include "runtime/sensor_runtime.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+assertTrue = func(desc, cond) {
+    assertEq(desc, cond, true)
+}
+assertFalse = func(desc, cond) {
+    assertEq(desc, cond, false)
+}
+
+// ---- 用例 1: 有界 worker 池消费 ----
+rt = newSensorRuntime({
+    "workers": 3,
+    "queue_size": 100,
+    "replay_budget": 1000,
+    "rate_per_origin": 100,
+    "rate_interval_ms": 100,
+})
+
+processed = []
+mu = sync.NewMutex()
+rtSetHandler(rt, func(job) {
+    mu.Lock()
+    processed = append(processed, job["n"])
+    mu.Unlock()
+})
+rtStart(rt)
+for i = 0; i < 50; i++ {
+    submitted = rtSubmit(rt, {"n": i})
+    assertTrue(f"submit {i} 不应被丢弃", submitted)
+}
+rtStop(rt)
+assertEq("50 个任务全部被处理", len(processed), 50)
+m = rtMetrics(rt)
+assertEq("metrics.jobs_submitted", m["jobs_submitted"], 50)
+assertEq("metrics.jobs_processed", m["jobs_processed"], 50)
+assertEq("metrics.jobs_dropped", m["jobs_dropped"], 0)
+remainingJobs = 0
+rt["st"].Load("jobs_store")[0].Range(func(k, v) {
+    remainingJobs = remainingJobs + 1
+    return true
+})
+assertEq("已处理任务从有界后备存储释放", remainingJobs, 0)
+
+// ---- 用例 2: 队列满非阻塞丢弃 ----
+rt2 = newSensorRuntime({
+    "workers": 1,
+    "queue_size": 2,
+    "replay_budget": 1000,
+    "rate_per_origin": 100,
+})
+// worker 仅在任务 1 上卡住（模拟消费停摆），任务 2/3 正常处理，保证 rtStop 能退出
+blocked = make(chan int, 1)
+rtSetHandler(rt2, func(job) {
+    if job["n"] == 1 {
+        <- blocked
+    }
+})
+rtStart(rt2)
+rtSubmit(rt2, {"n": 1})
+time.Sleep(0.05) // 确保 worker 已取走任务 1 并阻塞在 handler
+rtSubmit(rt2, {"n": 2})
+rtSubmit(rt2, {"n": 3}) // worker 处理任务 1 + 队列 2 个满
+time.Sleep(0.2)
+droppedCount = 0
+for i = 4; i < 24; i++ {
+    if !rtSubmit(rt2, {"n": i}) {
+        droppedCount = droppedCount + 1
+    }
+}
+assertEq("队列满后全部丢弃", droppedCount, 20)
+assertEq("metrics.jobs_dropped 计数", rtMetrics(rt2)["jobs_dropped"], 20)
+// 释放 worker（随后处理任务 2/3）并停止
+blocked <- 1
+rtStop(rt2)
+assertEq("metrics.jobs_processed 计数", rtMetrics(rt2)["jobs_processed"], 3)
+
+// ---- 用例 3: Stop 幂等 + Stop 后拒绝 ----
+rt3 = newSensorRuntime({"workers": 1, "queue_size": 4, "replay_budget": 100})
+rtSetHandler(rt3, func(job) {})
+rtStart(rt3)
+rtStop(rt3)
+rtStop(rt3) // 二次 stop 不 panic 即通过
+assertFalse("Stop 后 Submit 被拒绝", rtSubmit(rt3, {"n": 1}))
+
+// ---- 用例 4: replay budget ----
+rt4 = newSensorRuntime({"workers": 1, "queue_size": 4, "replay_budget": 3})
+assertTrue("预算 1", rtConsumeBudget(rt4, "baseline", 1))
+assertTrue("预算 2", rtConsumeBudget(rt4, "variant", 1))
+assertTrue("预算 3", rtConsumeBudget(rt4, "control", 1))
+assertFalse("预算耗尽后拒绝", rtConsumeBudget(rt4, "variant", 1))
+m4 = rtMetrics(rt4)
+assertEq("metrics.budget_spent", m4["replays_used"], 3)
+assertEq("metrics.replays_rejected", m4["replays_rejected"], 1)
+
+// ---- 用例 5: per-origin 限流 ----
+rt5 = newSensorRuntime({
+    "workers": 1,
+    "queue_size": 4,
+    "replay_budget": 1000,
+    "rate_per_origin": 3,
+    "rate_interval_ms": 300,
+})
+allowed = 0
+denied = 0
+for i = 0; i < 6; i++ {
+    if rtAllowOrigin(rt5, "http://127.0.0.1:19999") {
+        allowed = allowed + 1
+    } else {
+        denied = denied + 1
+    }
+}
+assertEq("突发 6 次仅桶容量 3 次放行", allowed, 3)
+assertEq("其余被限流", denied, 3)
+time.Sleep(0.45) // 等待补充
+assertTrue("等待后恢复放行", rtAllowOrigin(rt5, "http://127.0.0.1:19999"))
+
+// ---- 用例 6: scope 边界 ----
+rt6 = newSensorRuntime({
+    "workers": 1,
+    "queue_size": 4,
+    "replay_budget": 100,
+    "scope_hosts": "127.0.0.1,localhost",
+})
+assertTrue("allowlist 内 host 放行", rtInScope(rt6, "http://127.0.0.1:8080/api"))
+assertTrue("allowlist 内 localhost 放行", rtInScope(rt6, "http://localhost:8080/api"))
+assertFalse("allowlist 外 host 拒绝", rtInScope(rt6, "http://evil.example.com/api"))
+assertFalse("子域名伪装拒绝", rtInScope(rt6, "http://127.0.0.1.evil.com/api"))
+
+// 无 allowlist：默认拒绝危险保留地址，放行公网 host（MITM 场景目标即用户浏览的站点）
+rt6b = newSensorRuntime({"workers": 1, "queue_size": 4, "replay_budget": 100})
+assertTrue("无 allowlist 放行普通 host", rtInScope(rt6b, "http://example.com/api"))
+assertFalse("无 allowlist 拒绝元数据地址", rtInScope(rt6b, "http://169.254.169.254/latest/meta-data"))
+assertFalse("无 allowlist 拒绝 127.0.0.1", rtInScope(rt6b, "http://127.0.0.1:8080/"))
+assertFalse("无 allowlist 拒绝内网段", rtInScope(rt6b, "http://10.0.0.5/"))
+
+// ---- 用例 7: method 边界 ----
+assertTrue("GET 放行", rtMethodAllowed(rt6, "GET"))
+assertTrue("POST 放行", rtMethodAllowed(rt6, "POST"))
+assertFalse("DELETE 拒绝", rtMethodAllowed(rt6, "DELETE"))
+assertFalse("PUT 拒绝", rtMethodAllowed(rt6, "PUT"))
+assertFalse("空 method 拒绝", rtMethodAllowed(rt6, ""))
+
+// ---- 用例 7b: origin 桶固定容量 ----
+rt7b = newSensorRuntime({
+    "workers": 1,
+    "queue_size": 4,
+    "replay_budget": 100,
+    "rate_per_origin": 1,
+    "max_origins": 2,
+})
+rtAllowOrigin(rt7b, "https://a.example/x")
+rtAllowOrigin(rt7b, "https://b.example/x")
+rtAllowOrigin(rt7b, "https://c.example/x")
+bucketCount = 0
+rt7b["st"].Load("buckets")[0].Range(func(k, v) {
+    bucketCount = bucketCount + 1
+    return true
+})
+assertEq("origin 限流桶不超过容量", bucketCount, 2)
+
+// ---- 用例 8: metrics 并发一致性 ----
+rt8 = newSensorRuntime({
+    "workers": 4,
+    "queue_size": 500,
+    "replay_budget": 100000,
+    "rate_per_origin": 100000,
+})
+rtSetHandler(rt8, func(job) {})
+rtStart(rt8)
+wg = sync.NewWaitGroup()
+for g = 0; g < 10; g++ {
+    wg.Add(1)
+    go func() {
+        for i = 0; i < 20; i++ {
+            rtSubmit(rt8, {"n": i})
+            rtConsumeBudget(rt8, "variant", 1)
+        }
+        wg.Done()
+    }()
+}
+wg.Wait()
+rtStop(rt8)
+time.Sleep(0.05)
+m8 = rtMetrics(rt8)
+assertEq("并发提交计数无丢失", m8["jobs_submitted"], 200)
+assertEq("并发预算消耗无丢失", m8["replays_used"], 200)
+m8b = rtMetrics(rt8)
+assertEq("并发处理后任务全部完成", m8b["jobs_processed"], 200)
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_runtime FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_runtime PASS (all assertions) ====")

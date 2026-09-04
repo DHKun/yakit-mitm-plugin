@@ -1,91 +1,202 @@
 // main.yak — 智能流量辅助检测插件 · 入口
 // Yakit MITM 热加载插件（模块类型: mitm）
 //
-// 状态机: CAPTURED → DEDUP(同构丢弃) → PRUNE(剪枝) → PAYLOAD_GEN → DIFF(重放实证) → DISPLAY
-// LLM 失败/超时 → fallback_dict 降级，主链路不中断。
-//
-// 参数机制：MITM 热加载插件使用 cli.* + cli.check()（在 Yakit 交互劫持界面以表单呈现）。
-// 兼容 MITM_PARAMS（热加载/批量启用场景注入的全局 map，值全为 string）。
-//
-// 使用方式（二选一）：
-// A. 插件仓库导入本插件 → MITM 交互劫持 → 插件页启用（参数以表单填写）
-// B. MITM 交互劫持 → 热加载页粘贴全部代码（include 路径改为绝对路径或使用同目录相对路径）
+// 状态机: CAPTURED → DEDUP → PRUNE → PAYLOAD_GEN → REPLAY → EVIDENCE → DISPLAY
+// Hook 只向有界队列提交任务；固定 worker 执行分析和重放。
 
 // ---------- 模块加载 ----------
-include "traffic/struct.yak"
 include "traffic/dedup.yak"
 include "traffic/prune.yak"
 include "ai/schema.yak"
 include "ai/payload_agent.yak"
-include "diff/comparator.yak"
+include "runtime/sensor_runtime.yak"
+include "evidence/checker.yak"
 include "ui/panel.yak"
 
 // ---------- 参数声明 ----------
-llmBaseURL = cli.String("llm-base-url", cli.setDefault(""), cli.setVerboseName("LLM API 地址"), cli.setHelp("OpenAI 兼容 API 地址，如 https://api.openai.com/v1 或内网网关；留空则只走内置字典"))
-llmAPIKey = cli.String("llm-api-key", cli.setVerboseName("LLM API Key"), cli.setHelp("API 密钥；留空表示无需鉴权的内网网关"))
+llmBaseURL = cli.String("llm-base-url", cli.setDefault(""), cli.setVerboseName("LLM API 地址"), cli.setHelp("OpenAI 兼容 API 地址；留空则只走内置字典"))
+llmAPIKey = cli.String("llm-api-key", cli.setDefault(""), cli.setVerboseName("LLM API Key"), cli.setHelp("API 密钥；留空表示无需鉴权的内网网关"))
 llmModel = cli.String("llm-model", cli.setDefault("gpt-4o-mini"), cli.setVerboseName("模型名称"), cli.setHelp("OpenAI 兼容模型名"))
-maxCandidatesPerParam = cli.Int("max-candidates", cli.setDefault(3), cli.setVerboseName("单参数候选上限"), cli.setHelp("每个参数最多生成的 payload 候选数（防死循环）"))
+maxCandidatesPerParam = cli.Int("max-candidates", cli.setDefault(3), cli.setVerboseName("单参数候选上限"), cli.setHelp("每个参数最多生成的 payload 候选数"))
 replayTimeout = cli.Float("replay-timeout", cli.setDefault(8.0), cli.setVerboseName("重放超时(秒)"), cli.setHelp("单次重放请求超时秒数"))
-replayTotalLimit = cli.Int("replay-total-limit", cli.setDefault(60), cli.setVerboseName("会话重放总上限"), cli.setHelp("本次会话累计重放次数上限，防止对目标过度打点"))
-maxBodyPreview = cli.Int("max-body-preview", cli.setDefault(512), cli.setVerboseName("body 预览长度"), cli.setHelp("记录进 TrafficRecord 的响应体预览长度"))
+replayTotalLimit = cli.Int("replay-total-limit", cli.setDefault(60), cli.setVerboseName("会话重放总上限"), cli.setHelp("baseline/variant/control 共用的一次性预算"))
+runtimeWorkers = cli.Int("workers", cli.setDefault(2), cli.setVerboseName("分析 Worker 数"), cli.setHelp("固定并发 worker 数量"))
+runtimeQueueSize = cli.Int("queue-size", cli.setDefault(256), cli.setVerboseName("任务队列容量"), cli.setHelp("队列满时新镜像任务会被丢弃"))
+replayRPS = cli.Int("replay-rps", cli.setDefault(5), cli.setVerboseName("单站点每秒重放上限"), cli.setHelp("每个 origin 的令牌桶容量与每秒补充量"))
+maxOrigins = cli.Int("max-origins", cli.setDefault(256), cli.setVerboseName("Origin 桶容量"), cli.setHelp("最多保留的 per-origin 限流状态数量"))
+scopeHosts = cli.String("scope-hosts", cli.setDefault(""), cli.setVerboseName("目标 Host 白名单"), cli.setHelp("逗号分隔、精确匹配；空值仍拒绝保留/内网地址"))
+maxPayloadLen = cli.Int("max-payload-len", cli.setDefault(256), cli.setVerboseName("Payload 最大长度"), cli.setHelp("AI 与内置字典 payload 的统一长度上限"))
+timeDiffMs = cli.Int("time-diff-ms", cli.setDefault(2000), cli.setVerboseName("时延证据阈值(ms)"), cli.setHelp("variant 相对 baseline 的最小时延增量"))
+maxBodyPreview = cli.Int("max-body-preview", cli.setDefault(512), cli.setVerboseName("Body 预览长度"), cli.setHelp("TrafficRecord 中保存的响应体预览长度"))
 cli.check()
 
-// ---------- 运行时状态 ----------
-SENSOR_STATE = {
-    "dedup": newDeduplicator(),
-    "llm_client": nil,
-    "llm_inited": false,
-    "seen_total": 0,
-    "kept_unique": 0,
-    "candidates_gen": 0,
-    "replayed": 0,
-    "verified_diff": 0,
-    "record_id": 0,
-    "candidate_id": 0,
+// MITM 热加载场景可注入全局 MITM_PARAMS（值为 string）。这里复制一次后只读，
+// 避免 worker 并发读取一个可能被外部改写的普通 map。
+MITM_PARAMS_CACHE = {}
+if MITM_PARAMS != undefined && MITM_PARAMS != nil {
+    for k, v in MITM_PARAMS {
+        MITM_PARAMS_CACHE[k] = v
+    }
 }
 
-// initSensor 幂等初始化（参数优先级：cli > MITM_PARAMS）
-initSensor = func() {
-    if SENSOR_STATE["llm_inited"] {
-        return
+cfgString = func(cliValue, name) {
+    v = MITM_PARAMS_CACHE[name]
+    if v != undefined && v != nil && str.TrimSpace(string(v)) != "" {
+        return string(v)
     }
-    SENSOR_STATE["llm_inited"] = true
-    baseURL = llmBaseURL
-    apiKey = llmAPIKey
-    model = llmModel
-    // cli 参数为空时回落 MITM_PARAMS（热加载场景）
-    if baseURL == "" {
-        if MITM_PARAMS != undefined {
-            v = MITM_PARAMS["llm-base-url"]
-            if v != undefined && v != nil && string(v) != "" {
-                baseURL = string(v)
+    return string(cliValue)
+}
+
+cfgInt = func(cliValue, name, minimum) {
+    out = int(cliValue)
+    v = MITM_PARAMS_CACHE[name]
+    if v != undefined && v != nil && str.TrimSpace(string(v)) != "" {
+        try {
+            parsed = int(string(v))
+            if parsed >= minimum {
+                out = parsed
             }
-            v2 = MITM_PARAMS["llm-api-key"]
-            if v2 != undefined && v2 != nil {
-                apiKey = string(v2)
-            }
-            v3 = MITM_PARAMS["llm-model"]
-            if v3 != undefined && v3 != nil && string(v3) != "" {
-                model = string(v3)
-            }
+        } catch e {
+            yakit.Warn("参数 %s=%s 无法解析，使用默认值 %d", name, string(v), out)
         }
     }
-    SENSOR_STATE["llm_client"] = buildLlmClient({
-        "base_url": baseURL,
-        "api_key": apiKey,
-        "model": model,
-        "timeout": 30,
+    if out < minimum {
+        out = minimum
+    }
+    return out
+}
+
+cfgFloat = func(cliValue, name, minimum) {
+    out = float(cliValue)
+    v = MITM_PARAMS_CACHE[name]
+    if v != undefined && v != nil && str.TrimSpace(string(v)) != "" {
+        try {
+            parsed = float(string(v))
+            if parsed >= minimum {
+                out = parsed
+            }
+        } catch e {
+            yakit.Warn("参数 %s=%s 无法解析，使用默认值 %.1f", name, string(v), out)
+        }
+    }
+    if out < minimum {
+        out = minimum
+    }
+    return out
+}
+
+resolvedWorkers = cfgInt(runtimeWorkers, "workers", 1)
+resolvedQueueSize = cfgInt(runtimeQueueSize, "queue-size", 1)
+resolvedReplayBudget = cfgInt(replayTotalLimit, "replay-total-limit", 1)
+resolvedReplayRPS = cfgInt(replayRPS, "replay-rps", 1)
+resolvedMaxOrigins = cfgInt(maxOrigins, "max-origins", 1)
+resolvedScopeHosts = cfgString(scopeHosts, "scope-hosts")
+resolvedReplayTimeout = cfgFloat(replayTimeout, "replay-timeout", 0.1)
+resolvedMaxPayloadLen = cfgInt(maxPayloadLen, "max-payload-len", 8)
+resolvedTimeDiffMs = cfgInt(timeDiffMs, "time-diff-ms", 1)
+resolvedMaxBodyPreview = cfgInt(maxBodyPreview, "max-body-preview", 32)
+resolvedMaxCandidates = cfgInt(maxCandidatesPerParam, "max-candidates", 1)
+
+// include 中的函数在调用时读取这些全局阈值；探针与单测已验证重绑定生效。
+MAX_PAYLOAD_LEN = resolvedMaxPayloadLen
+EVIDENCE_DELAY_THRESHOLD_MS = resolvedTimeDiffMs
+
+// ---------- 并发运行时与状态 ----------
+SENSOR_RT = newSensorRuntime({
+    "workers": resolvedWorkers,
+    "queue_size": resolvedQueueSize,
+    "replay_budget": resolvedReplayBudget,
+    "rate_per_origin": resolvedReplayRPS,
+    "rate_interval_ms": 1000,
+    "max_origins": resolvedMaxOrigins,
+    "scope_hosts": resolvedScopeHosts,
+})
+
+// 所有运行期可变状态均存入 sync.Map；复合读改写与去重器调用持 SENSOR_MU。
+SENSOR_STATE = sync.NewMap()
+SENSOR_STATE.Store("initialized", false)
+SENSOR_STATE.Store("dedup", newDeduplicator())
+SENSOR_STATE.Store("llm_client", undefined)
+for k in ["seen_total", "kept_unique", "candidates_gen", "verified_diff", "observations", "skipped_scope", "skipped_method", "skipped_rate", "record_id", "candidate_id"] {
+    SENSOR_STATE.Store(k, 0)
+}
+SENSOR_MU = sync.NewMutex()
+SENSOR_INIT_MU = sync.NewMutex()
+
+sensGet = func(key) {
+    return SENSOR_STATE.Load(key)[0]
+}
+
+sensInc = func(key, n) {
+    SENSOR_MU.Lock()
+    value = int(SENSOR_STATE.Load(key)[0]) + n
+    SENSOR_STATE.Store(key, value)
+    SENSOR_MU.Unlock()
+    return value
+}
+
+sensRegisterFlow = func(fingerprint) {
+    SENSOR_MU.Lock()
+    SENSOR_STATE.Store("seen_total", int(SENSOR_STATE.Load("seen_total")[0]) + 1)
+    dedup = SENSOR_STATE.Load("dedup")[0]
+    duplicate, seenCount = dedupSeen(dedup, fingerprint)
+    recordId = 0
+    if !duplicate {
+        SENSOR_STATE.Store("kept_unique", int(SENSOR_STATE.Load("kept_unique")[0]) + 1)
+        recordId = int(SENSOR_STATE.Load("record_id")[0]) + 1
+        SENSOR_STATE.Store("record_id", recordId)
+    }
+    SENSOR_MU.Unlock()
+    return duplicate, recordId
+}
+
+sensNextCandidate = func() {
+    SENSOR_MU.Lock()
+    candidateId = int(SENSOR_STATE.Load("candidate_id")[0]) + 1
+    SENSOR_STATE.Store("candidate_id", candidateId)
+    SENSOR_STATE.Store("candidates_gen", int(SENSOR_STATE.Load("candidates_gen")[0]) + 1)
+    SENSOR_MU.Unlock()
+    return candidateId
+}
+
+sensSnapshot = func() {
+    SENSOR_MU.Lock()
+    snap = {}
+    for k in ["seen_total", "kept_unique", "candidates_gen", "verified_diff", "observations", "skipped_scope", "skipped_method", "skipped_rate"] {
+        snap[k] = SENSOR_STATE.Load(k)[0]
+    }
+    SENSOR_MU.Unlock()
+    return snap
+}
+
+// initSensor 初始化 LLM 与面板；并发 worker 只会执行一次。
+initSensor = func() {
+    if sensGet("initialized") {
+        return
+    }
+    SENSOR_INIT_MU.Lock()
+    if sensGet("initialized") {
+        SENSOR_INIT_MU.Unlock()
+        return
+    }
+    client = initLlm({
+        "base_url": cfgString(llmBaseURL, "llm-base-url"),
+        "api_key": cfgString(llmAPIKey, "llm-api-key"),
+        "model": cfgString(llmModel, "llm-model"),
+        "timeout": 30.0,
     })
+    SENSOR_STATE.Store("llm_client", client)
     panelInit()
-    if SENSOR_STATE["llm_client"] != nil {
-        yakit.Info("LLM 客户端已配置 (model=%s)", model)
+    SENSOR_STATE.Store("initialized", true)
+    SENSOR_INIT_MU.Unlock()
+    if client != nil && client != undefined {
+        yakit.Info("LLM 客户端已配置")
     } else {
         yakit.Info("LLM 未配置，将走内置字典降级路径")
     }
 }
 
-// extractParams 从请求报文提取参数 map（query + form post + json body 一层字段）
-// 返回 [params, paramSource]，paramSource: "query" | "post" | "json"
+// ---------- 请求解析与重放 ----------
 extractParams = func(reqRaw) {
     packet = string(reqRaw)
     method = poc.GetHTTPRequestMethod(packet)
@@ -111,12 +222,9 @@ extractParams = func(reqRaw) {
         }
         return params, "json"
     }
-    // 其他类型（multipart/二进制）暂不处理
     return {}, "none"
 }
 
-// buildReplayPacket 构造重放报文：把 payload 写入指定参数
-// 返回修改后的请求报文（string）
 buildReplayPacket = func(reqRaw, param, payload, paramSource) {
     packet = string(reqRaw)
     if paramSource == "query" {
@@ -125,21 +233,17 @@ buildReplayPacket = func(reqRaw, param, payload, paramSource) {
     if paramSource == "post" {
         return poc.ReplaceHTTPPacketPostParam(packet, param, payload)
     }
-    // json body：解析-改值-回写
     body = string(poc.GetHTTPPacketBody(packet))
     parsed = json.loads(body)
     if parsed == nil || parsed == undefined {
         return packet
     }
     parsed[param] = payload
-    newBody = json.dumps(parsed)
-    return string(poc.ReplaceHTTPPacketBody(packet, newBody))
+    return string(poc.ReplaceHTTPPacketBody(packet, json.dumps(parsed)))
 }
 
-// replayOnce 独立重放一次请求（不阻塞用户浏览的原始连接）
-// 返回 [rspBytes, err]
 replayOnce = func(isHttps, replayPacket) {
-    opts = [poc.timeout(float(replayTimeout))]
+    opts = [poc.timeout(float(resolvedReplayTimeout))]
     if isHttps {
         opts = append(opts, poc.https(true))
     }
@@ -147,108 +251,31 @@ replayOnce = func(isHttps, replayPacket) {
     return rsp, err
 }
 
-// processFlow 处理一条被镜像的流量（状态机主体）
-processFlow = func(isHttps, url, reqRaw, rspRaw) {
-    defer func() {
-        if err := recover(); err != nil {
-            yakit.Error("处理流量异常: %v", err)
-        }
-    }()
-    initSensor()
-
-    packet = string(reqRaw)
-    method = poc.GetHTTPRequestMethod(packet)
-
-    // --- DEDUP ---
-    params, paramSource = extractParams(packet)
-    if len(params) == 0 {
-        return
+// guardedReplay 是所有主动网络请求的唯一出口。
+// 每次请求依次通过 scope、method、per-origin 限流和统一预算。
+guardedReplay = func(rt, purpose, isHttps, url, replayPacket) {
+    method = poc.GetHTTPRequestMethod(string(replayPacket))
+    if !rtInScope(rt, url) {
+        sensInc("skipped_scope", 1)
+        return nil, 0, "scope denied"
     }
-    fingerprint = computeFingerprint(method, url, params)
-    SENSOR_STATE["seen_total"] = SENSOR_STATE["seen_total"] + 1
-    dup, seenCount = dedupSeen(SENSOR_STATE["dedup"], fingerprint)
-    if dup {
-        return // 同构请求保留首条
+    if !rtMethodAllowed(rt, method) {
+        sensInc("skipped_method", 1)
+        return nil, 0, "method denied"
     }
-    SENSOR_STATE["kept_unique"] = SENSOR_STATE["kept_unique"] + 1
-    SENSOR_STATE["record_id"] = SENSOR_STATE["record_id"] + 1
-
-    // --- PRUNE ---
-    keptParams, pruned, total = pruneParams(params)
-    if len(keptParams) == 0 {
-        return
+    if !rtAllowOrigin(rt, url) {
+        sensInc("skipped_rate", 1)
+        return nil, 0, "rate limited"
     }
-
-    // --- 构造 TrafficRecord ---
-    bodyPreview = string(poc.GetHTTPPacketBody(string(rspRaw)))
-    if len(bodyPreview) > maxBodyPreview {
-        bodyPreview = str.ShrinkString(bodyPreview, maxBodyPreview)
+    if !rtConsumeBudget(rt, purpose, 1) {
+        return nil, 0, "replay budget exhausted"
     }
-    record = newTrafficRecord(
-        SENSOR_STATE["record_id"], fingerprint, method, url,
-        keysOf(keptParams), bodyPreview,
-        poc.GetStatusCodeFromResponse(string(rspRaw)), len(bodyPreview),
-        time.Now().Unix(),
-    )
-
-    // --- PAYLOAD_GEN + DIFF（逐参数逐候选）---
-    path = normalizeUrlPath(url)
-    for paramName, paramValue in keptParams {
-        pType = paramTypeOf(paramValue)
-        if pType == "bool" {
-            continue // bool 参数无探测价值
-        }
-        cands, usedLlm = generateCandidates(SENSOR_STATE["llm_client"], paramName, paramValue, pType, method, path)
-        if len(cands) == 0 {
-            continue
-        }
-        if len(cands) > maxCandidatesPerParam {
-            cands = cands[:maxCandidatesPerParam]
-        }
-        for c in cands {
-            // 防死循环：会话总重放上限
-            if SENSOR_STATE["replayed"] >= replayTotalLimit {
-                yakit.Warn("已达会话重放上限 %d，停止后续重放", replayTotalLimit)
-                return
-            }
-            SENSOR_STATE["candidate_id"] = SENSOR_STATE["candidate_id"] + 1
-            candidate = newPayloadCandidate(
-                SENSOR_STATE["candidate_id"], record["id"],
-                c["param"], c["payload"], c["vuln_hint"], c["reason"],
-                c["confidence"], c["expected_diff_signature"], c["source"],
-            )
-            SENSOR_STATE["candidates_gen"] = SENSOR_STATE["candidates_gen"] + 1
-
-            // 重放：基线（原样重放）+ 变体（注入 payload）
-            // 基线重放一次并缓存到 record（同 record 只打一次基线）
-            if record["baseline_rsp"] == undefined {
-                baseRsp, baseErr = replayOnce(isHttps, poc.FixHTTPRequest(packet))
-                if baseErr != nil {
-                    continue // 目标重放不可达，跳过该流量
-                }
-                record["baseline_rsp"] = baseRsp
-            }
-            replayPacket = buildReplayPacket(packet, candidate["param"], candidate["payload"], paramSource)
-            varRsp, varErr = replayOnce(isHttps, replayPacket)
-            SENSOR_STATE["replayed"] = SENSOR_STATE["replayed"] + 1
-            if varErr != nil {
-                dr = newDiffResult(candidate["id"], "", "", 0.0, "replay_failed", [string(varErr)])
-                panelReportVerdict(record, candidate, dr)
-                continue
-            }
-            // --- DIFF 判定 ---
-            dr = compareResponses(candidate["id"], record["baseline_rsp"], varRsp)
-            if dr["verdict"] == "differential" {
-                SENSOR_STATE["verified_diff"] = SENSOR_STATE["verified_diff"] + 1
-            }
-            // --- DISPLAY ---
-            panelReportVerdict(record, candidate, dr)
-        }
-    }
-    panelProgress(SENSOR_STATE["seen_total"], SENSOR_STATE["kept_unique"], SENSOR_STATE["candidates_gen"], SENSOR_STATE["verified_diff"])
+    startedAt = time.Now().UnixMilli()
+    rsp, err = replayOnce(isHttps, replayPacket)
+    elapsedMs = time.Now().UnixMilli() - startedAt
+    return rsp, elapsedMs, err
 }
 
-// keysOf 取 map 的键数组（保留原顺序）
 keysOf = func(m) {
     out = []
     for k, _ in m {
@@ -257,15 +284,141 @@ keysOf = func(m) {
     return out
 }
 
-// ---------- MITM 镜像钩子注册 ----------
-// mirrorFilteredHTTPFlow: 官方推荐的过滤镜像钩子（自动过滤 js/css/图片等静态资源）
-mirrorFilteredHTTPFlow = func(isHttps, url, req, rsp, body) {
-    go func() {
-        defer func() {
-            if err := recover(); err != nil {
-                yakit.Error("镜像钩子异常: %v", err)
+// ---------- 状态机 ----------
+// processFlow 是同步处理接口；并发度由 SensorRuntime 的固定 worker 池控制。
+processFlow = func(rt, isHttps, url, reqRaw, rspRaw) {
+    initSensor()
+    packet = string(reqRaw)
+    method = poc.GetHTTPRequestMethod(packet)
+
+    // 流量在进入去重与候选生成前先过静态门禁。
+    if !rtMethodAllowed(rt, method) {
+        sensInc("skipped_method", 1)
+        return
+    }
+    if !rtInScope(rt, url) {
+        sensInc("skipped_scope", 1)
+        return
+    }
+
+    params, paramSource = extractParams(packet)
+    if len(params) == 0 {
+        return
+    }
+    fingerprint = computeFingerprint(method, url, params)
+    duplicate, recordId = sensRegisterFlow(fingerprint)
+    if duplicate {
+        return
+    }
+
+    keptParams, pruned, total = pruneParams(params)
+    if len(keptParams) == 0 {
+        return
+    }
+
+    bodyPreview = string(poc.GetHTTPPacketBody(string(rspRaw)))
+    if len(bodyPreview) > resolvedMaxBodyPreview {
+        bodyPreview = str.ShrinkString(bodyPreview, resolvedMaxBodyPreview)
+    }
+    record = newTrafficRecord(
+        recordId, fingerprint, method, url,
+        keysOf(keptParams), bodyPreview,
+        poc.GetStatusCodeFromResponse(string(rspRaw)), len(bodyPreview),
+        time.Now().Unix(),
+    )
+
+    path = normalizeUrlPath(url)
+    for paramName, paramValue in keptParams {
+        pType = paramTypeOf(paramValue)
+        if pType == "bool" {
+            continue
+        }
+        cands, usedLlm = generateCandidates(sensGet("llm_client"), paramName, paramValue, pType, method, path)
+        if len(cands) == 0 {
+            continue
+        }
+        if len(cands) > resolvedMaxCandidates {
+            cands = cands[:resolvedMaxCandidates]
+        }
+        for c in cands {
+            candidate = newPayloadCandidate(
+                sensNextCandidate(), record["id"],
+                c["param"], c["payload"], c["vuln_hint"], c["reason"],
+                c["confidence"], c["expected_diff_signature"], c["source"],
+            )
+
+            // 同一 record 只重放一次 baseline，后续候选复用响应与耗时。
+            if record["baseline_rsp"] == undefined {
+                baseRsp, baseMs, baseErr = guardedReplay(rt, "baseline", isHttps, url, poc.FixHTTPRequest(packet))
+                if baseErr != nil {
+                    yakit.Warn("基线重放跳过: %s %s (%s)", method, url, string(baseErr))
+                    return
+                }
+                record["baseline_rsp"] = baseRsp
+                record["baseline_ms"] = baseMs
             }
-        }()
-        processFlow(isHttps, url, req, rsp)
-    }()
+
+            replayPacket = buildReplayPacket(packet, candidate["param"], candidate["payload"], paramSource)
+            varRsp, varMs, varErr = guardedReplay(rt, "variant", isHttps, url, replayPacket)
+            if varErr != nil {
+                dr = newDiffResult(candidate["id"], "", "", 0.0, "replay_failed", [string(varErr)])
+                panelReportVerdict(record, candidate, dr, undefined)
+                continue
+            }
+
+            dr = compareResponses(candidate["id"], record["baseline_rsp"], varRsp)
+            evidence = undefined
+            if dr["verdict"] == "differential" {
+                evidence = matchEvidence(
+                    candidate["vuln_hint"], candidate["expected_diff_signature"], candidate["payload"],
+                    record["baseline_rsp"], varRsp, record["baseline_ms"], varMs,
+                )
+                evidence["control_confirmed"] = false
+                evidence["confirmed"] = false
+
+                // 结构化证据命中后再做 control 重放，确认差异可归因于 payload。
+                if evidence["matched"] {
+                    ctrlRsp, ctrlMs, ctrlErr = guardedReplay(rt, "control", isHttps, url, poc.FixHTTPRequest(packet))
+                    if ctrlErr == nil && controlStable(record["baseline_rsp"], ctrlRsp) {
+                        evidence["control_confirmed"] = true
+                        evidence["confirmed"] = true
+                    } else if ctrlErr != nil {
+                        evidence["reason"] = string(evidence["reason"]) + "; control replay failed: " + string(ctrlErr)
+                    } else {
+                        evidence["reason"] = string(evidence["reason"]) + "; control response is unstable"
+                    }
+                }
+
+                if evidence["confirmed"] {
+                    sensInc("verified_diff", 1)
+                } else {
+                    sensInc("observations", 1)
+                }
+            }
+            panelReportVerdict(record, candidate, dr, evidence)
+        }
+    }
+
+    snap = sensSnapshot()
+    metrics = rtMetrics(rt)
+    panelProgress(
+        snap["seen_total"], snap["kept_unique"], snap["candidates_gen"],
+        snap["verified_diff"], snap["observations"], metrics["replays_used"], metrics["jobs_dropped"],
+    )
 }
+
+// ---------- MITM Hook 与 worker 启动 ----------
+// Hook 无网络、无 LLM、无派生 goroutine；队列满时快速丢弃并记 metrics。
+mirrorFilteredHTTPFlow = func(isHttps, url, req, rsp, body) {
+    rtSubmit(SENSOR_RT, {
+        "is_https": isHttps,
+        "url": string(url),
+        "req": string(req),
+        "rsp": string(rsp),
+    })
+}
+
+rtSetHandler(SENSOR_RT, func(job) {
+    processFlow(SENSOR_RT, job["is_https"], job["url"], job["req"], job["rsp"])
+})
+rtStart(SENSOR_RT)

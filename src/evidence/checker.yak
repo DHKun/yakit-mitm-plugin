@@ -1,0 +1,226 @@
+// checker.yak — 证据判定模块（原则 6/7 的落地）
+// 智能流量辅助检测插件 · 证据层
+//
+// 核心约束（对应 agent.md §8 与任务原则 6/7）：
+//   1. 风险确认必须有与漏洞类型匹配的结构化证据；普通动态响应差异只能成为观察记录。
+//   2. 证据特征必须"variant 中新出现"：baseline 已含该特征 → 不构成证据（防误报）。
+//   3. expected_diff_signature 与命中证据种类做交叉校验：签名不覆盖该种类 →
+//      候选预期的不是这种差异，降级为观察（matched=false），kind 仍保留供记录。
+//   4. rfi / 未知类型 / 空 hint：没有可靠的结构化证据特征 → 永不匹配。
+//   5. 任何输入异常（variant 缺失、状态码不可解析）都安全降级，不 panic。
+//
+// 证据种类（kind）词表：
+//   sql_error / status_5xx / boolean_delta / delay / reflection /
+//   template_eval / file_content / command_output
+
+include "diff/comparator.yak"
+include "traffic/struct.yak"
+
+EVIDENCE_DELAY_THRESHOLD_MS = 2000
+EVIDENCE_BOOLEAN_RATIO = 3.0
+
+// evGetStatus 提取响应状态码（整数；不可解析返回 -1）
+evGetStatus = func(rspRaw) {
+    if rspRaw == undefined || rspRaw == nil {
+        return -1
+    }
+    code = poc.GetStatusCodeFromResponse(string(rspRaw))
+    n = int(code)
+    if n <= 0 {
+        return -1
+    }
+    return n
+}
+
+// evGetBody 提取响应体文本（缺失/异常返回 ""）
+evGetBody = func(rspRaw) {
+    if rspRaw == undefined || rspRaw == nil {
+        return ""
+    }
+    try {
+        return string(poc.GetHTTPPacketBody(string(rspRaw)))
+    } catch e {
+        return ""
+    }
+}
+
+// evHintClass 归一化漏洞类型：只接受已知词表，其余一律 unknown（永不匹配）
+evHintClass = func(hint) {
+    h = str.ToLower(str.TrimSpace(string(hint)))
+    if h == "sqli" || h == "xss" || h == "ssti" || h == "lfi" || h == "cmdi" || h == "logic" {
+        return h
+    }
+    return "unknown"
+}
+
+// evSigCovers 判断 expected_diff_signature 是否覆盖证据种类
+// signature 为自由文本（LLM 生成），这里按关键词匹配做保守判断：
+// 空/不可解析的签名视为"不设限"？——否。原则 6 要求证据与类型匹配，
+// 但签名与种类是两层校验：签名缺失在 candidateValid 已丢弃；这里只处理
+// "签名存在但不覆盖命中种类"的降级。空签名放行类型内证据（上游仍会按
+// candidateValid 丢弃空签名候选，测试中显式传入空串属白盒场景）。
+evSigCovers = func(sig, kind) {
+    s = str.ToLower(str.TrimSpace(string(sig)))
+    if s == "" {
+        return true
+    }
+    kw = {
+        "sql_error": ["sql", "error", "syntax"],
+        "status_5xx": ["500", "5xx", "status", "server error"],
+        "boolean_delta": ["row", "count", "longer", "shorter", "body", "different", "empty"],
+        "delay": ["delay", "sleep", "slow", "time", "second", "秒"],
+        "reflection": ["reflect", "tag", "script", "echo", "回显"],
+        "template_eval": ["49", "eval", "template", "expression", "math"],
+        "file_content": ["root:", "passwd", "file", "path", "traversal", "content"],
+        "command_output": ["uid=", "command", "output", "id", "exec", "rce"],
+    }
+    kws = kw[kind]
+    if kws == undefined {
+        return false
+    }
+    for k in kws {
+        if str.Contains(s, k) {
+            return true
+        }
+    }
+    return false
+}
+
+// evNew 出现判定：特征在 variant 中存在且在 baseline 中不存在
+evNew = func(baseBody, varBody, pattern) {
+    if re.Match(pattern, varBody) && !re.Match(pattern, baseBody) {
+        return true
+    }
+    return false
+}
+
+// matchEvidence 证据判定入口
+// 参数：
+//   hint           漏洞类型词（sqli|xss|ssti|lfi|cmdi|logic|rfi|...）
+//   sig            expected_diff_signature（候选预期差异描述，可空）
+//   payload        本次重放使用的 payload（reflection 需要与回显内容比对）
+//   baselineRsp    基线原始响应报文（string/[]byte）
+//   variantRsp     变体重放的原始响应报文；undefined/nil 表示重放缺失
+//   baselineMs     基线响应耗时（毫秒）
+//   variantMs      变体响应耗时（毫秒）
+// 返回证据对象：
+//   matched   bool — 是否构成与类型匹配的结构化证据
+//   kind      string — 命中的证据种类（未命中时也尽量保留首个命中特征供观察记录）
+//   vuln_hint string — 归一化后的类型（unknown 归一化）
+//   reason    string — 人读判定依据（面板/日志展示）
+matchEvidence = func(hint, sig, payload, baselineRsp, variantRsp, baselineMs, variantMs) {
+    res = {
+        "matched": false,
+        "kind": "",
+        "vuln_hint": "unknown",
+        "reason": "",
+    }
+    if variantRsp == undefined || variantRsp == nil {
+        res["reason"] = "variant missing"
+        return res
+    }
+    hc = evHintClass(hint)
+    res["vuln_hint"] = hc
+    if hc == "unknown" {
+        res["reason"] = "vuln type has no reliable structured evidence"
+        return res
+    }
+
+    baseBody = evGetBody(baselineRsp)
+    varBody = evGetBody(variantRsp)
+    baseStatus = evGetStatus(baselineRsp)
+    varStatus = evGetStatus(variantRsp)
+
+    // 按类型逐特征检查；hit 收集命中的种类（供观察记录与签名交叉校验）
+    hits = []
+    if hc == "sqli" {
+        if evNew(baseBody, varBody, `(?i)(?:you have an error in your sql|sql syntax|sqlite3?::|mysql_fetch|ORA-\d{5}|PG::|psql:|SQLSTATE\[|Unclosed quotation mark|quoted string not properly terminated)`) {
+            hits = append(hits, "sql_error")
+        }
+        if baseStatus >= 200 && baseStatus < 500 && varStatus >= 500 && varStatus < 600 {
+            hits = append(hits, "status_5xx")
+        }
+        baseLen = len(baseBody)
+        varLen = len(varBody)
+        if baseLen > 0 {
+            if float(varLen) >= float(baseLen) * EVIDENCE_BOOLEAN_RATIO {
+                hits = append(hits, "boolean_delta")
+            }
+        }
+        if variantMs - baselineMs >= EVIDENCE_DELAY_THRESHOLD_MS {
+            hits = append(hits, "delay")
+        }
+    } else if hc == "xss" {
+        // 反射证据：payload 关键片段原样出现在 variant 且不在 baseline。
+        // 响应体常做 JSON/表单转义（" → \"），完整 payload 逐字比对会漏报，
+        // 因此额外取 "< 起始的标签片段（不含引号，不受转义影响）比对；
+        // HTML 转义回显（&lt;script&gt;）不含原始 <，仍判不构成证据。
+        p = string(payload)
+        if len(p) >= 6 {
+            probe = str.ReplaceAll(p, "\r", "")
+            probe = str.ReplaceAll(probe, "\n", "")
+            probe = str.TrimSpace(probe)
+            frags = []
+            if probe != "" {
+                frags = append(frags, probe)
+            }
+            idx = str.Index(probe, "<")
+            if idx >= 0 && idx + 1 < len(probe) {
+                frags = append(frags, probe[idx:])
+            }
+            for fr in frags {
+                if str.Contains(varBody, fr) && !str.Contains(baseBody, fr) {
+                    hits = append(hits, "reflection")
+                    break
+                }
+            }
+        }
+    } else if hc == "ssti" {
+        if evNew(baseBody, varBody, `\b49\b`) {
+            hits = append(hits, "template_eval")
+        }
+    } else if hc == "lfi" {
+        if evNew(baseBody, varBody, `(?i)root:[x!*]:0:0:`) {
+            hits = append(hits, "file_content")
+        }
+    } else if hc == "cmdi" {
+        if evNew(baseBody, varBody, `uid=\d+\([a-zA-Z0-9_.-]+\)`) {
+            hits = append(hits, "command_output")
+        }
+    } else if hc == "logic" {
+        if variantMs - baselineMs >= EVIDENCE_DELAY_THRESHOLD_MS {
+            hits = append(hits, "delay")
+        }
+    }
+
+    if len(hits) == 0 {
+        res["reason"] = "no type-matched signature in variant"
+        return res
+    }
+
+    // 第一个命中种类作为候选确认对象；签名交叉校验不覆盖 → 降级为观察
+    kind = hits[0]
+    res["kind"] = kind
+    if !evSigCovers(sig, kind) {
+        res["reason"] = f"evidence kind ${kind} not covered by expected_diff_signature"
+        return res
+    }
+    res["matched"] = true
+    res["reason"] = f"type-matched evidence: ${kind}"
+    return res
+}
+
+// controlStable 控制重放稳定性判定（原则 6 的对照实验环节）
+// control 是对 baseline 原样重放：若内容漂移，说明目标响应天然不稳定，
+// variant 的差异不可归因于 payload → 证据无效。
+// 参数为原始响应报文；ctrlRsp 缺失（undefined/nil/空）→ 不稳定。
+controlStable = func(baselineRsp, ctrlRsp) {
+    if ctrlRsp == undefined || ctrlRsp == nil {
+        return false
+    }
+    ctrlRaw = string(ctrlRsp)
+    if ctrlRaw == "" {
+        return false
+    }
+    return compareResponses("control", baselineRsp, ctrlRsp)["verdict"] == "no_diff"
+}

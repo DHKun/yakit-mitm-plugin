@@ -8,6 +8,37 @@
 //
 // LLM 后端：OpenAI 兼容 API（ai.OpenAI + ai.apiKey/ai.baseURL/ai.model/ai.timeout）
 
+// MAX_PAYLOAD_LEN AI 产出 payload 的最大长度（原则 5：AI 输出不得作为无约束输入）
+MAX_PAYLOAD_LEN = 256
+
+// HINT_ALLOWLIST 允许的 vuln_hint 词表（与 evidence/checker.yak 及 schema.yak 一致）
+HINT_ALLOWLIST = ["sqli", "xss", "ssti", "lfi", "rfi", "cmdi", "logic"]
+
+// normalizeHint 归一化 vuln_hint：小写 + 白名单；白名单外一律 unknown
+// （rfi 保留在词表中供下游证据层"永不匹配"判定，但不会误标成其他类型）
+normalizeHint = func(hint) {
+    h = str.ToLower(str.TrimSpace(string(hint)))
+    for k in HINT_ALLOWLIST {
+        if h == k {
+            return h
+        }
+    }
+    return "unknown"
+}
+
+// sanitizePayload 清洗 AI 产出的 payload（原则 5）：
+// 1. 剥离 \r \n \t 与其余 C0 控制字符与 DEL（防响应拆分/注入头/日志伪造）
+//    （C1 区 \x80-\x9f 在 Go regexp 中非法，改为逐字符 rune 过滤）
+// 2. 长度截断到 MAX_PAYLOAD_LEN（防超大 payload 打爆重放与面板）
+CTRL_CHAR_RE = "[\\x00-\\x1f\\x7f]"
+sanitizePayload = func(p) {
+    s = re.ReplaceAll(string(p), CTRL_CHAR_RE, "")
+    if len(s) > MAX_PAYLOAD_LEN {
+        s = s[0:MAX_PAYLOAD_LEN]
+    }
+    return s
+}
+
 // buildLlmClient 构造 LLM 客户端
 // cfg: {"base_url": str, "api_key": str, "model": str, "timeout": float}
 // base_url 为空时返回 nil（表示 LLM 未配置，直接走降级路径）
@@ -40,19 +71,35 @@ buildLlmClient = func(cfg) {
 
 // LLM_STATE 全局 LLM 客户端缓存与失败计数（防反复重试拖垮链路）
 // 注意：不预置 "client" 键，未初始化时取值为 nil（undefined）
+// 并发规则（与 sensor_runtime.yak 规则 A/C 一致）：
+//   - LLM_STATE 在构造期写入初始值后，运行期仅允许持 LLM_MU 做 read-modify-write；
+//   - MITM 插件下 worker 并发调用 generateCandidates，裸写会触发
+//     `fatal error: concurrent map read and map write`（进程级 fatal，不可捕获）。
 LLM_STATE = {
     "inited": false,
     "fail_count": 0,
 }
+LLM_MU = sync.NewMutex()
 
-// initLlm 从 MITM_PARAMS / cli 参数初始化 LLM 客户端（幂等）
+// initLlm 从 MITM_PARAMS / cli 参数初始化 LLM 客户端（幂等、并发安全）
 initLlm = func(cfg) {
+    LLM_MU.Lock()
     if LLM_STATE["inited"] {
-        return LLM_STATE["client"]
+        c = LLM_STATE["client"]
+        LLM_MU.Unlock()
+        return c
     }
     LLM_STATE["inited"] = true
-    LLM_STATE["client"] = buildLlmClient(cfg)
-    return LLM_STATE["client"]
+    client = nil
+    try {
+        client = buildLlmClient(cfg)
+    } catch e {
+        yakit.Warn("LLM 客户端初始化失败，使用内置字典: %v", e)
+    }
+    LLM_STATE["client"] = client
+    c = LLM_STATE["client"]
+    LLM_MU.Unlock()
+    return c
 }
 
 // llmGenerateCandidates 用 LLM 为单个参数生成候选
@@ -99,8 +146,8 @@ llmGenerateCandidates = func(client, paramName, paramValue, paramType, method, u
         item = arr[i]
         c = {
             "param": string(item["param"]),
-            "payload": string(item["payload"]),
-            "vuln_hint": string(item["vuln_hint"]),
+            "payload": sanitizePayload(item["payload"]),
+            "vuln_hint": normalizeHint(item["vuln_hint"]),
             "reason": string(item["reason"]),
             "confidence": float(item["confidence"]),
             "expected_diff_signature": string(item["expected_diff_signature"]),
@@ -111,6 +158,10 @@ llmGenerateCandidates = func(client, paramName, paramValue, paramType, method, u
         }
         // 硬约束：payload 为空的丢弃
         if c["payload"] == "" || c["payload"] == "<nil>" {
+            continue
+        }
+        // 硬约束：清洗后超长（截断仍超 MAX_PAYLOAD_LEN 不可能，这里兜底防御截断前已超限的原始 payload）
+        if len(string(item["payload"])) > MAX_PAYLOAD_LEN {
             continue
         }
         out = append(out, c)
@@ -130,8 +181,8 @@ fallbackCandidates = func(paramName, paramType) {
         item = dict[i]
         c = {
             "param": paramName,
-            "payload": item["payload"],
-            "vuln_hint": item["vuln_hint"],
+            "payload": sanitizePayload(item["payload"]),
+            "vuln_hint": normalizeHint(item["vuln_hint"]),
             "reason": item["reason"],
             "confidence": item["confidence"],
             "expected_diff_signature": item["expected_diff_signature"],
@@ -147,8 +198,12 @@ fallbackCandidates = func(paramName, paramType) {
 
 // generateCandidates 候选生成统一入口：LLM 优先、失败降级字典
 // 返回 [candidates, usedLlm(bool)]
+// fail_count 的读改写全程持 LLM_MU（规则 C：sync.Map/map 无原子 RMW）
 generateCandidates = func(client, paramName, paramValue, paramType, method, urlPath) {
-    if client != nil && LLM_STATE["fail_count"] < 3 {
+    LLM_MU.Lock()
+    fc = LLM_STATE["fail_count"]
+    LLM_MU.Unlock()
+    if client != nil && fc < 3 {
         cands, err = llmGenerateCandidates(client, paramName, paramValue, paramType, method, urlPath)
         if err == nil {
             if len(cands) == 0 {
@@ -161,7 +216,9 @@ generateCandidates = func(client, paramName, paramValue, paramType, method, urlP
             return cands, true
         }
         // LLM 失败：计数并降级
+        LLM_MU.Lock()
         LLM_STATE["fail_count"] = LLM_STATE["fail_count"] + 1
+        LLM_MU.Unlock()
     }
     return fallbackCandidates(paramName, paramType), false
 }

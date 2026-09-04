@@ -9,10 +9,12 @@
 yakit-mitm-plugin/
 ├── agent.md / IMPLEMENTATION_PLAN.md / AI_INIT.md
 ├── src/
-│   ├── main.yak          # 入口，注册 mirrorFilteredHTTPFlow + yakit.AutoInitYakit()；读 MITM_PARAMS，不写 cli.*
+│   ├── main.yak          # 入口，注册 mirrorFilteredHTTPFlow + yakit.AutoInitYakit()；兼容 cli.* / MITM_PARAMS
 │   ├── traffic/          # dedup / prune / struct
 │   ├── ai/               # payload_agent / schema
 │   ├── diff/             # comparator（结构化 Diff）
+│   ├── runtime/          # 有界队列、worker、预算、限流与 scope/method 门禁
+│   ├── evidence/         # 漏洞类型证据与 control 稳定性校验
 │   └── ui/               # panel（yakit.* GUI 调用）
 ├── README.md             # 上架文档
 └── test/
@@ -21,7 +23,7 @@ yakit-mitm-plugin/
 >
 > **公开上架流程（已确认）**：登录 + **仅原创**；上传选**私密**（自己/分享可见，不上架）或**公开**（需**管理员审核**后才在商店展示）。"进官方仓库"需**联系 yaklang.io 团队**，非纯上传。参考 [插件商店使用指南](https://yaklang.io/blog/yakit-plugin-store-guide/)。
 >
-> **参数声明分流**：官方文档只对**原生 Yak 模块**写明 `cli.*` + `cli.check()`（生态"模拟点击爆破"即此写法，仅作范式参考）。本项目是 **MITM 热加载插件**。**实现时需对照实际 Yakit GUI 验证**：MITM 类插件在创建时的"模块类型"选项、以及参数到底取 `MITM_PARAMS` 还是能用 `cli.*`——官方文档未此给出权威结论，此为运行时参数机制层面的实现点，不阻塞架构。
+> **参数兼容**：实现声明 `cli.*` 参数，并读取热加载场景的 `MITM_PARAMS` 同名字符串值；注入值经过类型与下限校验。
 >
 > **范围界定**：`simulator.*`（`simulator.HttpBruteForce` 等）是"模拟点击爆破"模块，**与"流量辅助检测"无关，不采用**。
 
@@ -37,7 +39,7 @@ DiffResult: { candidate_id, baseline_hash, variant_hash, diff_score, verdict, di
 `CAPTURED → DEDUP(同构丢弃) → PRUNE → PAYLOAD_GEN → DIFF → DISPLAY`；LLM 失败/超时走 `fallback_dict` 降级。
 
 ## 4. 数据流 / AI 交互
-- 数据流：`mirrorFilteredHTTPFlow` 截获 → 去重 → 剪枝 → 结构化记录 → LLM 生成候选 → 逐个重放（重放走插件内独立 HTTP 请求，不阻塞用户浏览）→ Diff 判定 → 面板仅展示有差异者。
+- 数据流：`mirrorFilteredHTTPFlow` 非阻塞提交 → 有界 worker → 去重 → 剪枝 → LLM 候选 → scope/method/预算/限流重放 → Diff → 类型证据 → control → verified/observation 分流。
 - System Prompt 要点：候选必须给 `expected_diff_signature`；与参数类型无关的 payload 不得推荐；无把握 `confidence≤0.3`；输出 strict JSON，空数组表示建议放弃该参数。
 - **防幻觉**：LLM 只提候选，是否成立由 Diff 重放实证；无预期差异特征直接丢弃。
 

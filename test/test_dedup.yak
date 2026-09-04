@@ -82,6 +82,16 @@ for i = 0; i < 100; i++ {
 uniq3, _ = dedupStats(dedup3)
 assertEq("100条同构去重后 ≤10 条", uniq3 <= 10, true)
 
+// ---- 用例 7: 高基数指纹按固定容量淘汰 ----
+DEDUP_MAX_ENTRIES = 3
+dedup4 = newDeduplicator()
+for i = 0; i < 8; i++ {
+    dedupSeen(dedup4, computeFingerprint("GET", f"http://api.example.com/item/${i}", {"id": string(i)}))
+}
+uniq4, total4 = dedupStats(dedup4)
+assertEq("指纹缓存不超过容量", uniq4, 3)
+assertEq("淘汰后只统计当前窗口", total4, 3)
+
 // ---- 汇总 ----
 if len(failures) > 0 {
     println("==== test_dedup FAILED:", len(failures), "failures ====")

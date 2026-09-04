@@ -1,15 +1,19 @@
-// test_e2e.yak — 状态机端到端集成测试
+// test_e2e.yak — 主链路集成测试
 // 运行: cd src && yak ../test/test_e2e.yak
 //
-// 内嵌一个"易受攻击"的 Mock 目标（quote 注入 → SQL 错误回显），不出网。
-// 验证完整链路: 截获 → 去重 → 剪枝 → 候选生成 → 重放 → Diff 判定 → 面板分流
-//
-// 用例：
-// 1. 注入型 payload 触发 SQL 错误 → verdict=differential，verified_diff 计数 +1
-// 2. 无害 payload 响应不变 → verdict=no_diff
-// 3. 同构流量第二次截获 → 被去重跳过（kept_unique 不增长）
-// 4. 黑名单参数（csrf/session）不进入候选生成
-// 5. LLM 未配置 → 走 fallback 字典（source=fallback）
+// 所有 HTTP 请求仅访问本机 mock 服务。覆盖：
+// - 结构化 SQLi 证据 + control 稳定 → verified
+// - 普通动态差异 → observation
+// - scope/method 门禁、统一预算、Hook→有界队列、去重与剪枝
+
+MITM_PARAMS = {
+    "scope-hosts": "127.0.0.1",
+    "replay-total-limit": "6",
+    "replay-rps": "100",
+    "workers": "2",
+    "queue-size": "32",
+    "max-candidates": "3",
+}
 
 include "main.yak"
 
@@ -17,15 +21,22 @@ failures = []
 
 assertEq = func(desc, got, want) {
     if got != want {
-        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        failures = append(failures, f"FAIL ${desc}: got ${got} want ${want}")
         println("FAIL", desc, "got", got, "want", want)
     } else {
         println("ok  ", desc)
     }
 }
+assertTrue = func(desc, cond) {
+    assertEq(desc, cond, true)
+}
+assertFalse = func(desc, cond) {
+    assertEq(desc, cond, false)
+}
 
-// ---- Mock 易受攻击目标 ----
-// 行为: id 参数包含单引号 → 返回 SQL 错误回显；其余情况返回正常 JSON
+// Mock 目标：
+// - 单引号触发 SQL 错误（可验证证据）
+// - 1=2 触发普通内容变化（仅观察）
 go func() {
     server = tcp.Serve("127.0.0.1", 18700, tcp.serverCallback(func(conn) {
         defer conn.Close()
@@ -38,6 +49,8 @@ go func() {
         body = `{"id": 42, "name": "alice"}`
         if str.Contains(idParam, "'") {
             body = `{"err": "You have an error in your SQL syntax near '1''"}`
+        } else if str.Contains(idParam, "1=2") {
+            body = `{"note": "branch changed", "x": 1}`
         }
         rsp = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: ${len(body)}\r\n\r\n${body}"
         conn.Send(rsp)
@@ -47,43 +60,83 @@ time.Sleep(0.3)
 
 target = "http://127.0.0.1:18700"
 
-// ---- 用例 1+2+5: 首次截获 → 完整链路 ----
+// ---- 用例 1: verified + observation + 剪枝 ----
 url1 = target + "/api/user?id=42&csrf_token=abc&session_id=xyz"
 isHttps, req1, _ = poc.ParseUrlToHTTPRequestRaw("GET", url1)
 rsp1, _, _ = poc.HTTP(string(req1))
-processFlow(false, url1, string(req1), string(rsp1))
-time.Sleep(2)
+processFlow(SENSOR_RT, false, url1, string(req1), string(rsp1))
 
-assertEq("截获计数", SENSOR_STATE["seen_total"], 1)
-assertEq("去重保留", SENSOR_STATE["kept_unique"], 1)
-// 剪枝: csrf_token + session_id 被剪掉，只剩 id → int fallback 字典 4 条被单参数上限截为 3
-assertEq("剪枝后仅 id 参数进入候选（受单参数上限截断）", SENSOR_STATE["candidates_gen"], 3)
-// 其中 1' 触发 SQL 错误 → differential
-assertEq("注入 payload 实证差异计数", SENSOR_STATE["verified_diff"], 1)
+assertEq("截获计数", sensGet("seen_total"), 1)
+assertEq("去重保留", sensGet("kept_unique"), 1)
+assertEq("剪枝后仅 id 生成三个候选", sensGet("candidates_gen"), 3)
+assertEq("SQL 错误 + 稳定 control 形成已确认风险", sensGet("verified_diff"), 1)
+assertEq("无类型证据的动态差异成为观察", sensGet("observations"), 1)
 
-// ---- 用例 3: 同构流量去重 ----
+// ---- 用例 2: 同构去重 ----
 url2 = target + "/api/user?id=100&csrf_token=def&session_id=zzz"
 isHttps, req2, _ = poc.ParseUrlToHTTPRequestRaw("GET", url2)
 rsp2, _, _ = poc.HTTP(string(req2))
-processFlow(false, url2, string(req2), string(rsp2))
-time.Sleep(0.5)
-assertEq("同构流量被去重（截获计数 +1）", SENSOR_STATE["seen_total"], 2)
-assertEq("同构流量不产生新候选", SENSOR_STATE["candidates_gen"], 3)
+processFlow(SENSOR_RT, false, url2, string(req2), string(rsp2))
+assertEq("同构流量计入截获", sensGet("seen_total"), 2)
+assertEq("同构流量不产生新候选", sensGet("candidates_gen"), 3)
 
-// ---- 用例 4: 黑名单参数不进入候选生成 ----
-// url1 已含 csrf_token/session_id 且确实未生成对应候选（candidates_gen 全部来自 id 参数）
-// 上面断言已覆盖，这里再显式验证剪枝函数行为：
+// ---- 用例 3: method 门禁 ----
+urlMethod = target + "/api/user?id=7"
+_, reqMethod, _ = poc.ParseUrlToHTTPRequestRaw("PUT", urlMethod)
+processFlow(SENSOR_RT, false, urlMethod, string(reqMethod), string(rsp1))
+assertEq("PUT 在候选生成前被拒绝", sensGet("skipped_method"), 1)
+assertEq("PUT 不产生候选", sensGet("candidates_gen"), 3)
+
+// ---- 用例 4: scope 门禁（不发起 DNS/公网请求）----
+urlScope = "http://outside.invalid/api/user?id=7"
+_, reqScope, _ = poc.ParseUrlToHTTPRequestRaw("GET", urlScope)
+localSyntheticRsp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+processFlow(SENSOR_RT, false, urlScope, string(reqScope), localSyntheticRsp)
+assertEq("白名单外 host 在网络请求前被拒绝", sensGet("skipped_scope"), 1)
+
+// ---- 用例 5: 统一预算 ----
+// 用例 1 消耗 baseline + 3 variant + 1 control = 5；本流量 baseline 消耗第 6 个预算，
+// 三个 variant 全部被预算闸门拒绝。
+urlBudget = target + "/api/user?id=777"
+_, reqBudget, _ = poc.ParseUrlToHTTPRequestRaw("GET", urlBudget)
+rspBudget, _, _ = poc.HTTP(string(reqBudget))
+processFlow(SENSOR_RT, false, urlBudget, string(reqBudget), string(rspBudget))
+metrics = rtMetrics(SENSOR_RT)
+assertEq("baseline/variant/control 共用预算", metrics["replays_used"], 6)
+assertEq("预算耗尽后三个 variant 被拒绝", metrics["replays_rejected"], 3)
+assertEq("预算拒绝仍保留候选计数", sensGet("candidates_gen"), 6)
+assertEq("预算拒绝不生成额外风险", sensGet("verified_diff"), 1)
+
+// ---- 用例 6: Hook 仅提交队列，worker 完成处理 ----
+mirrorFilteredHTTPFlow(false, url1, string(req1), string(rsp1), "")
+time.Sleep(1)
+metrics = rtMetrics(SENSOR_RT)
+assertEq("Hook 提交任务由 worker 处理", metrics["jobs_processed"], 1)
+assertEq("Hook 路径复用同构去重", sensGet("seen_total"), 4)
+assertEq("Hook 未派生额外候选", sensGet("candidates_gen"), 6)
+
+// ---- 用例 7: 剪枝与 LLM 降级仍保持原功能 ----
 kept, pruned, total = pruneParams({"id": "1", "csrf_token": "a", "session_id": "b"})
 assertEq("黑名单剪除计数", pruned, 2)
 assertEq("黑名单剪除后仅剩 id", len(kept), 1)
+cands, usedLlm = generateCandidates(sensGet("llm_client"), "id", "42", "int", "GET", "/api/user")
+assertFalse("LLM 未配置走降级", usedLlm)
+assertEq("降级候选来源", cands[0]["source"], "fallback")
 
-// ---- 用例 5: fallback 来源 ----
-// LLM 未配置（本测试没有设置 base_url）→ 走 fallback
-cands, usedLlm = generateCandidates(SENSOR_STATE["llm_client"], "id", "42", "int", "GET", "/api/user")
-assertEq("LLM 未配置走降级", usedLlm, false)
-assertEq("降级候选 source", cands[0]["source"], "fallback")
+// ---- 用例 8: per-origin 令牌桶配置 ----
+limitedRt = newSensorRuntime({
+    "workers": 1,
+    "queue_size": 4,
+    "replay_budget": 10,
+    "rate_per_origin": 1,
+    "rate_interval_ms": 60000,
+    "scope_hosts": "127.0.0.1",
+})
+assertTrue("首笔 origin 请求获得令牌", rtAllowOrigin(limitedRt, target + "/a"))
+assertFalse("同一 origin 超额请求被限流", rtAllowOrigin(limitedRt, target + "/b"))
 
-// ---- 汇总 ----
+rtStop(SENSOR_RT)
+
 if len(failures) > 0 {
     println("==== test_e2e FAILED:", len(failures), "failures ====")
     die(str.Join(failures, "\n"))

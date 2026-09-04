@@ -10,8 +10,8 @@
 - **辅助**：Go（如需编译型性能组件）
 - **LLM**：内网模型或 OpenAI 兼容 API，走统一 `ai/payload_agent.yak` 封装。
 - **集成**：Yakit MITM 热加载钩子 **`mirrorFilteredHTTPFlow`**（官方推荐，自动过滤 js/css/图片等静态资源流量；`mirrorHTTPFlow` 是全量镜像，一般不要用）。注册后需在脚本内调用 `yakit.AutoInitYakit()` 才能与 GUI 实时交互。
-- **参数声明（按插件类型分流）**：官方文档只对**原生 Yak 模块**写明 `cli.String(...)` / `cli.StringSlice(...)` / `cli.Float(...)` / `cli.Int(...)` + `cli.check()`（参考生态里的"模拟点击爆破 simulator"插件）。**MITM 热加载类插件的参数机制，官方文档无权威说明**——实现时对照实际 Yakit GUI 实测；**未验证前先按全局 `MITM_PARAMS`**（取值 string，需自行 `parseInt`/`parseBool`）处理，不混用 `cli.*`（见 §3 待实测点）。
-- **范围界定**：`simulator.*`（`simulator.HttpBruteForce` 等）是"模拟点击爆破"模块，**与本项目"流量辅助检测"无关**，仅作为 Yakit 编程范式（cli 声明 / `cli.setCliGroup` 分组 / `yakit.Info`/`yakit.Error` 回传）的参考，**不采用、不引入**。
+- **参数兼容**：入口同时声明 `cli.*` 表单参数并读取全局 `MITM_PARAMS`；热加载注入值覆盖 CLI 默认值，数值统一做边界校验。
+- **范围界定**：`simulator.*` 属于模拟点击爆破模块；本项目保持 MITM 流量辅助检测范围。
 
 ## 3. 目录架构（模块落位标记）
 ```
@@ -24,13 +24,15 @@ yakit-mitm-plugin/
 │   ├── traffic/             # dedup.yak / prune.yak / struct.yak
 │   ├── ai/                  # payload_agent.yak / schema.yak
 │   ├── diff/                # comparator.yak（结构化 Diff 判定）
+│   ├── runtime/             # sensor_runtime.yak（队列/worker/预算/限流/scope）
+│   ├── evidence/            # checker.yak（类型证据 + control 校验）
 │   └── ui/                  # panel.yak（yakit.* GUI 调用：Info/SetProgress/表格）
 ├── README.md                # 上架文档（安装/使用/截图）
 └── test/                    # test_dedup.yak / test_diff.yak
 ```
 > **元数据（已确认）**：插件元数据（模块类型/名称/描述/作者/Tags）在 **GUI 创建插件时直接配置**并随代码入库（官方标注均非必填）；**不存在也不要求 `yakit.json`/`yak.yaml`/manifest**，本项目**不写任何元数据清单文件**（参考 [插件仓库](https://yaklang.com/products/Plugin-repository/)）。公开上架需登录 + 仅原创，公开需管理员审核（参考 [商店指南](https://yaklang.io/blog/yakit-plugin-store-guide/)）。
 >
-> **待实现时在 Yakit 里实测的一点**：MITM 类插件在"模块类型"里如何选、参数机制是 `MITM_PARAMS` 还是 `cli.*`——官方文档仅对原生模块写明 `cli.*`，未见 MITM 类的权威说明；此为运行时实现点，不阻塞架构。
+> **运行时兼容策略**：插件仓库场景使用 `cli.*` 表单；热加载/批量启用场景可通过 `MITM_PARAMS` 注入同名字符串参数。
 
 ## 4. 状态机（单条流量）
 ```
@@ -56,5 +58,5 @@ LLM 生成失败/超时 → `fallback_dict`（内置字典）降级，保证主�
 - 不改 Yakit 本体；不在插件内落盘明文敏感数据。
 - 未经 Diff 实证的 payload 不得标记"有效"。
 - 重放流量走插件内发起的独立 HTTP 请求（`poc.*` 或 `http.*`），不依赖用户正在浏览的那条连接，避免影响正常浏览。
-- **不实现"模拟点击爆破 / simulator / 登录爆破"等无关能力**；`cli.*` 仅适用于原生 Yak 模块，本项目用 `MITM_PARAMS`。
+- 范围保持在 MITM 流量辅助检测；参数同时兼容 `cli.*` 与 `MITM_PARAMS`。
 - **不写任何元数据 manifest**（`yakit.json`/`yak.yaml` 均不存在，见 §3 已确认说明）。

@@ -1,0 +1,176 @@
+// test_evidence.yak — 证据判定模块单元测试
+// 运行: cd src && yak ../test/test_evidence.yak
+//
+// 原则 6/7 的落地验证：
+//   - 普通动态响应差异（无类型匹配特征）→ matched=false → 上游只能记观察
+//   - 风险确认必须有与漏洞类型匹配的结构化证据（variant 中新出现、baseline 中不存在）
+//   - expected_diff_signature 与证据种类交叉校验，签名不覆盖 → 降级为观察
+//
+// 用例：
+// 1. sqli: SQL 错误回显 → sql_error；错误已在 baseline → 不构成证据
+// 2. sqli: 200 → 500 → status_5xx；baseline 已是 5xx → 不构成证据
+// 3. sqli: 行数显著变化 → boolean_delta
+// 4. sqli/logic: 引入时延 ≥ 2s → delay；baseline 自身慢或时延不足 → 不构成证据
+// 5. expected_diff_signature 交叉校验：签名不覆盖命中种类 → matched=false
+// 6. xss: 原样标签回显 → reflection；HTML 转义回显 → 不构成证据
+// 7. ssti: 49 出现 → template_eval；baseline 已含 49 → 不构成证据
+// 8. lfi: root:x:0:0 → file_content
+// 9. cmdi: uid=0(root) → command_output；未识别签名不阻断类型内证据
+// 10. rfi / 未知 / 空 hint：永不匹配（即使响应含其他类型的强特征）
+// 11. controlStable：一致/纯噪声 → 稳定；内容漂移/缺失 control → 不稳定
+// 12. variant 缺失 → 不 panic、不构成证据
+
+include "evidence/checker.yak"
+
+failures = []
+
+assertEq = func(desc, got, want) {
+    if got != want {
+        failures = append(failures, f"FAIL {desc}: got ${got} want ${want}")
+        println("FAIL", desc, "got", got, "want", want)
+    } else {
+        println("ok  ", desc)
+    }
+}
+assertTrue = func(desc, cond) {
+    assertEq(desc, cond, true)
+}
+assertFalse = func(desc, cond) {
+    assertEq(desc, cond, false)
+}
+
+// mkRsp 用给定状态行与响应体构造原始 HTTP 响应报文
+mkRsp = func(statusLine, body) {
+    return f"HTTP/1.1 ${statusLine}\r\nContent-Type: application/json\r\nContent-Length: ${len(body)}\r\n\r\n${body}"
+}
+
+// ---- 基线响应 ----
+normalBody = `{"id": 42, "name": "alice"}`
+normalRsp = mkRsp("200 OK", normalBody)
+
+// ---- 用例 1: sqli — SQL 错误回显 ----
+sqliBody = `{"err": "You have an error in your SQL syntax near '1''"}`
+sqliRsp = mkRsp("200 OK", sqliBody)
+e = matchEvidence("sqli", "SQL error text or 500 status", "1'", normalRsp, sqliRsp, 100, 120)
+assertTrue("sqli SQL错误回显匹配证据", e["matched"])
+assertEq("sqli 证据种类", e["kind"], "sql_error")
+assertEq("sqli 证据类型标注", e["vuln_hint"], "sqli")
+
+preRsp = mkRsp("200 OK", sqliBody)
+e2 = matchEvidence("sqli", "SQL error text or 500 status", "1'", preRsp, sqliRsp, 100, 120)
+assertFalse("baseline 已含 SQL 错误 → 不构成证据", e2["matched"])
+
+e2b = matchEvidence("sqli", "", "1'", normalRsp, sqliRsp, 100, 120)
+assertTrue("空签名放行类型内证据", e2b["matched"])
+
+// ---- 用例 2: sqli — 状态码证据 ----
+rsp500 = mkRsp("500 Internal Server Error", `{"error": "internal server error"}`)
+e3 = matchEvidence("sqli", "SQL error text or 500 status", "1'", normalRsp, rsp500, 100, 110)
+assertTrue("200→500 构成 status_5xx 证据", e3["matched"])
+assertEq("status_5xx 种类", e3["kind"], "status_5xx")
+
+rsp502Base = mkRsp("500 Internal Server Error", normalBody)
+rsp502 = mkRsp("502 Bad Gateway", normalBody)
+e3b = matchEvidence("sqli", "", "1'", rsp502Base, rsp502, 100, 110)
+assertFalse("baseline 已是 5xx → 不构成证据", e3b["matched"])
+
+// ---- 用例 3: sqli — 布尔注入行数变化 ----
+rows = []
+for i = 0; i < 15; i++ {
+    rows = append(rows, `{"r": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+}
+bigBody = `{"rows": [` + str.Join(rows, ",") + `], "n": 15}`
+rspBig = mkRsp("200 OK", bigBody)
+e4 = matchEvidence("sqli", "row count change (longer/different body)", "1 OR 1=1", normalRsp, rspBig, 100, 110)
+assertTrue("行数显著变化构成 boolean_delta", e4["matched"])
+assertEq("boolean_delta 种类", e4["kind"], "boolean_delta")
+
+// ---- 用例 4: 时延证据 ----
+e5 = matchEvidence("sqli", "response delay >= 2s", "sleep(3)#", normalRsp, normalRsp, 100, 2500)
+assertTrue("引入时延 ≥2s 构成 delay 证据", e5["matched"])
+assertEq("delay 种类", e5["kind"], "delay")
+
+e5b = matchEvidence("sqli", "response delay >= 2s", "sleep(3)#", normalRsp, normalRsp, 2000, 2200)
+assertFalse("baseline 自身慢 → 引入时延不足 → 不构成证据", e5b["matched"])
+
+e5c = matchEvidence("sqli", "response delay >= 2s", "sleep(3)#", normalRsp, normalRsp, 100, 300)
+assertFalse("时延低于阈值 → 不构成证据", e5c["matched"])
+
+e5d = matchEvidence("logic", "response delay >= 2s", "1; waitfor delay '0:0:3'", normalRsp, normalRsp, 100, 2200)
+assertTrue("logic 类型按时延确认", e5d["matched"])
+assertEq("logic 证据种类", e5d["kind"], "delay")
+
+// ---- 用例 5: expected_diff_signature 交叉校验 ----
+e6 = matchEvidence("sqli", "row count change (longer/different body)", "sleep(3)#", normalRsp, normalRsp, 100, 2500)
+assertFalse("签名不覆盖 delay 证据 → 降级为观察", e6["matched"])
+assertEq("降级时保留命中种类供观察", e6["kind"], "delay")
+
+// ---- 用例 6: xss — 反射回显 ----
+xssPayload = `'"<script>alert(1)</script>`
+xssBody = `{"v": "'\"<script>alert(1)</script>", "id": 1}`
+xssRsp = mkRsp("200 OK", xssBody)
+e7 = matchEvidence("xss", "reflected tag in response body", xssPayload, normalRsp, xssRsp, 100, 110)
+assertTrue("原样标签回显构成 reflection 证据", e7["matched"])
+assertEq("reflection 种类", e7["kind"], "reflection")
+
+escRsp = mkRsp("200 OK", `{"v": "&lt;script&gt;alert(1)&lt;/script&gt;", "id": 1}`)
+e7b = matchEvidence("xss", "reflected tag in response body", xssPayload, normalRsp, escRsp, 100, 110)
+assertFalse("HTML 转义回显不构成 reflection 证据", e7b["matched"])
+
+// ---- 用例 7: ssti — 模板求值 ----
+sstiPayload = `{{7*7}}`
+sstiRsp = mkRsp("200 OK", `{"v": "{{7*7}}", "calc": 49}`)
+e8 = matchEvidence("ssti", "49 appears in response body", sstiPayload, normalRsp, sstiRsp, 100, 110)
+assertTrue("49 出现构成 template_eval", e8["matched"])
+assertEq("template_eval 种类", e8["kind"], "template_eval")
+
+has49Base = mkRsp("200 OK", `{"total": 49, "v": "x"}`)
+has49Var = mkRsp("200 OK", `{"total": 49, "v": "{{7*7}}"}`)
+e8b = matchEvidence("ssti", "49 appears in response body", sstiPayload, has49Base, has49Var, 100, 110)
+assertFalse("baseline 已含 49 → 不构成证据", e8b["matched"])
+
+// ---- 用例 8: lfi — 文件内容 ----
+lfiRsp = mkRsp("200 OK", `{"content": "root:x:0:0:root:/root:/bin/bash"}`)
+e9 = matchEvidence("lfi", "root: appears in response body", "../../etc/passwd", normalRsp, lfiRsp, 100, 110)
+assertTrue("passwd 内容构成 file_content", e9["matched"])
+assertEq("file_content 种类", e9["kind"], "file_content")
+
+// ---- 用例 9: cmdi — 命令输出 ----
+cmdiRsp = mkRsp("200 OK", `{"out": "uid=0(root) gid=0(root) groups=0(root)"}`)
+e10 = matchEvidence("cmdi", "command output appears in response", ";id", normalRsp, cmdiRsp, 100, 110)
+assertTrue("命令输出构成 command_output", e10["matched"])
+assertEq("command_output 种类", e10["kind"], "command_output")
+
+// ---- 用例 10: rfi / 未知 / 空 hint 永不匹配 ----
+e11 = matchEvidence("rfi", "remote content included", "http://c.example/x.txt", normalRsp, sqliRsp, 100, 110)
+assertFalse("rfi 永不匹配（即使响应含其他类型强特征）", e11["matched"])
+
+e11b = matchEvidence("weird-type", "", "x", normalRsp, sqliRsp, 100, 110)
+assertFalse("未知类型永不匹配", e11b["matched"])
+
+e11c = matchEvidence("", "", "x", normalRsp, sqliRsp, 100, 110)
+assertFalse("空 hint 视为 unknown 永不匹配", e11c["matched"])
+assertEq("空 hint 归一化为 unknown", e11c["vuln_hint"], "unknown")
+
+// ---- 用例 11: controlStable 控制重放稳定性 ----
+assertTrue("相同响应 → 控制稳定", controlStable(normalRsp, normalRsp))
+noiseBase = mkRsp("200 OK", `{"id": 42, "name": "alice", "ts": 1700000000, "request_id": "aaa111bbb222ccc333ddd"}`)
+noiseCtrl = mkRsp("200 OK", `{"id": 42, "name": "alice", "ts": 1700009999, "request_id": "fff111bbb222ccc333ddd"}`)
+assertTrue("纯噪声漂移 → 控制稳定", controlStable(noiseBase, noiseCtrl))
+noiseLineBase = mkRsp("200 OK", "cache: alpha")
+noiseLineCtrl = mkRsp("200 OK", "cache: beta")
+assertEq("未被归一化的噪声变化判为 noise", compareResponses("ctrl-noise", noiseLineBase, noiseLineCtrl)["verdict"], "noise")
+assertFalse("noise 级 control 漂移不参与确认", controlStable(noiseLineBase, noiseLineCtrl))
+assertTrue("内容漂移 → 控制不稳定", !controlStable(normalRsp, sqliRsp))
+assertFalse("缺失 control → 不稳定", controlStable(normalRsp, undefined))
+
+// ---- 用例 12: variant 缺失 ----
+e12 = matchEvidence("sqli", "SQL error text or 500 status", "1'", normalRsp, undefined, 100, 110)
+assertFalse("variant 缺失 → 不构成证据且不 panic", e12["matched"])
+
+// ---- 汇总 ----
+if len(failures) > 0 {
+    println("==== test_evidence FAILED:", len(failures), "failures ====")
+    die(str.Join(failures, "\n"))
+}
+println("==== test_evidence PASS (all assertions) ====")
